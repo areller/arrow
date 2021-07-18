@@ -30,6 +30,7 @@ namespace internal {
 namespace {
 
 using arrow::internal::int128_t;
+using arrow::internal::VisitSetBitRunsVoid;
 
 template <typename ArrowType>
 struct VarStdState {
@@ -49,24 +50,13 @@ struct VarStdState {
 
     using SumType =
         typename std::conditional<is_floating_type<T>::value, double, int128_t>::type;
-    SumType sum = 0;
+    SumType sum = arrow::compute::detail::SumArray<CType, SumType>(*array.data());
 
-    const ArrayData& data = *array.data();
-    const CType* values = data.GetValues<CType>(1);
-    arrow::internal::VisitSetBitRunsVoid(data.buffers[0], data.offset, data.length,
-                                         [&](int64_t pos, int64_t len) {
-                                           for (int64_t i = 0; i < len; ++i) {
-                                             sum += static_cast<SumType>(values[pos + i]);
-                                           }
-                                         });
-
-    double mean = static_cast<double>(sum) / count, m2 = 0;
-    arrow::internal::VisitSetBitRunsVoid(
-        data.buffers[0], data.offset, data.length, [&](int64_t pos, int64_t len) {
-          for (int64_t i = 0; i < len; ++i) {
-            const double v = static_cast<double>(values[pos + i]);
-            m2 += (v - mean) * (v - mean);
-          }
+    const double mean = static_cast<double>(sum) / count;
+    const double m2 = arrow::compute::detail::SumArray<CType, double>(
+        *array.data(), [mean](CType value) {
+          const double v = static_cast<double>(value);
+          return (v - mean) * (v - mean);
         });
 
     this->count = count;
@@ -98,14 +88,14 @@ struct VarStdState {
         int128_t square_sum = 0;
         const ArrayData& data = *slice->data();
         const CType* values = data.GetValues<CType>(1);
-        arrow::internal::VisitSetBitRunsVoid(
-            data.buffers[0], data.offset, data.length, [&](int64_t pos, int64_t len) {
-              for (int64_t i = 0; i < len; ++i) {
-                const auto value = values[pos + i];
-                sum += value;
-                square_sum += static_cast<uint64_t>(value) * value;
-              }
-            });
+        VisitSetBitRunsVoid(data.buffers[0], data.offset, data.length,
+                            [&](int64_t pos, int64_t len) {
+                              for (int64_t i = 0; i < len; ++i) {
+                                const auto value = values[pos + i];
+                                sum += value;
+                                square_sum += static_cast<uint64_t>(value) * value;
+                              }
+                            });
 
         const double mean = static_cast<double>(sum) / count;
         // calculate m2 = square_sum - sum * sum / count
@@ -161,17 +151,19 @@ struct VarStdImpl : public ScalarAggregator {
                       const VarianceOptions& options, VarOrStd return_type)
       : out_type(out_type), options(options), return_type(return_type) {}
 
-  void Consume(KernelContext*, const ExecBatch& batch) override {
+  Status Consume(KernelContext*, const ExecBatch& batch) override {
     ArrayType array(batch[0].array());
     this->state.Consume(array);
+    return Status::OK();
   }
 
-  void MergeFrom(KernelContext*, KernelState&& src) override {
+  Status MergeFrom(KernelContext*, KernelState&& src) override {
     const auto& other = checked_cast<const ThisType&>(src);
     this->state.MergeFrom(other.state);
+    return Status::OK();
   }
 
-  void Finalize(KernelContext*, Datum* out) override {
+  Status Finalize(KernelContext*, Datum* out) override {
     if (this->state.count <= options.ddof) {
       out->value = std::make_shared<DoubleScalar>();
     } else {
@@ -179,12 +171,41 @@ struct VarStdImpl : public ScalarAggregator {
       out->value =
           std::make_shared<DoubleScalar>(return_type == VarOrStd::Var ? var : sqrt(var));
     }
+    return Status::OK();
   }
 
   std::shared_ptr<DataType> out_type;
   VarStdState<ArrowType> state;
   VarianceOptions options;
   VarOrStd return_type;
+};
+
+struct ScalarVarStdImpl : public ScalarAggregator {
+  explicit ScalarVarStdImpl(const VarianceOptions& options)
+      : options(options), seen(false) {}
+
+  Status Consume(KernelContext*, const ExecBatch& batch) override {
+    seen = batch[0].scalar()->is_valid;
+    return Status::OK();
+  }
+
+  Status MergeFrom(KernelContext*, KernelState&& src) override {
+    const auto& other = checked_cast<const ScalarVarStdImpl&>(src);
+    seen = seen || other.seen;
+    return Status::OK();
+  }
+
+  Status Finalize(KernelContext*, Datum* out) override {
+    if (!seen || options.ddof > 0) {
+      out->value = std::make_shared<DoubleScalar>();
+    } else {
+      out->value = std::make_shared<DoubleScalar>(0.0);
+    }
+    return Status::OK();
+  }
+
+  const VarianceOptions options;
+  bool seen;
 };
 
 struct VarStdInitState {
@@ -218,25 +239,32 @@ struct VarStdInitState {
     return Status::OK();
   }
 
-  std::unique_ptr<KernelState> Create() {
-    ctx->SetStatus(VisitTypeInline(in_type, this));
+  Result<std::unique_ptr<KernelState>> Create() {
+    RETURN_NOT_OK(VisitTypeInline(in_type, this));
     return std::move(state);
   }
 };
 
-std::unique_ptr<KernelState> StddevInit(KernelContext* ctx, const KernelInitArgs& args) {
+Result<std::unique_ptr<KernelState>> StddevInit(KernelContext* ctx,
+                                                const KernelInitArgs& args) {
   VarStdInitState visitor(
       ctx, *args.inputs[0].type, args.kernel->signature->out_type().type(),
       static_cast<const VarianceOptions&>(*args.options), VarOrStd::Std);
   return visitor.Create();
 }
 
-std::unique_ptr<KernelState> VarianceInit(KernelContext* ctx,
-                                          const KernelInitArgs& args) {
+Result<std::unique_ptr<KernelState>> VarianceInit(KernelContext* ctx,
+                                                  const KernelInitArgs& args) {
   VarStdInitState visitor(
       ctx, *args.inputs[0].type, args.kernel->signature->out_type().type(),
       static_cast<const VarianceOptions&>(*args.options), VarOrStd::Var);
   return visitor.Create();
+}
+
+Result<std::unique_ptr<KernelState>> ScalarVarStdInit(KernelContext* ctx,
+                                                      const KernelInitArgs& args) {
+  return arrow::internal::make_unique<ScalarVarStdImpl>(
+      static_cast<const VarianceOptions&>(*args.options));
 }
 
 void AddVarStdKernels(KernelInit init,
@@ -245,6 +273,9 @@ void AddVarStdKernels(KernelInit init,
   for (const auto& ty : types) {
     auto sig = KernelSignature::Make({InputType::Array(ty)}, float64());
     AddAggKernel(std::move(sig), init, func);
+
+    sig = KernelSignature::Make({InputType::Scalar(ty)}, float64());
+    AddAggKernel(std::move(sig), ScalarVarStdInit, func);
   }
 }
 

@@ -18,6 +18,7 @@
 #include "arrow/compute/cast.h"
 
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -26,10 +27,12 @@
 
 #include "arrow/compute/cast_internal.h"
 #include "arrow/compute/exec.h"
+#include "arrow/compute/function_internal.h"
 #include "arrow/compute/kernel.h"
 #include "arrow/compute/kernels/codegen_internal.h"
 #include "arrow/compute/registry.h"
 #include "arrow/util/logging.h"
+#include "arrow/util/reflection_internal.h"
 
 namespace arrow {
 
@@ -37,6 +40,9 @@ using internal::ToTypeName;
 
 namespace compute {
 namespace internal {
+
+// ----------------------------------------------------------------------
+// Function options
 
 namespace {
 
@@ -116,34 +122,44 @@ class CastMetaFunction : public MetaFunction {
   }
 };
 
+static auto kCastOptionsType = GetFunctionOptionsType<CastOptions>(
+    arrow::internal::DataMember("to_type", &CastOptions::to_type),
+    arrow::internal::DataMember("allow_int_overflow", &CastOptions::allow_int_overflow),
+    arrow::internal::DataMember("allow_time_truncate", &CastOptions::allow_time_truncate),
+    arrow::internal::DataMember("allow_time_overflow", &CastOptions::allow_time_overflow),
+    arrow::internal::DataMember("allow_decimal_truncate",
+                                &CastOptions::allow_decimal_truncate),
+    arrow::internal::DataMember("allow_float_truncate",
+                                &CastOptions::allow_float_truncate),
+    arrow::internal::DataMember("allow_invalid_utf8", &CastOptions::allow_invalid_utf8));
 }  // namespace
 
 void RegisterScalarCast(FunctionRegistry* registry) {
   DCHECK_OK(registry->AddFunction(std::make_shared<CastMetaFunction>()));
+  DCHECK_OK(registry->AddFunctionOptionsType(kCastOptionsType));
 }
-
 }  // namespace internal
 
-struct CastFunction::CastFunctionImpl {
-  Type::type out_type;
-  std::unordered_set<int> in_types;
-};
+CastOptions::CastOptions(bool safe)
+    : FunctionOptions(internal::kCastOptionsType),
+      allow_int_overflow(!safe),
+      allow_time_truncate(!safe),
+      allow_time_overflow(!safe),
+      allow_decimal_truncate(!safe),
+      allow_float_truncate(!safe),
+      allow_invalid_utf8(!safe) {}
 
-CastFunction::CastFunction(std::string name, Type::type out_type)
-    : ScalarFunction(std::move(name), Arity::Unary(), /*doc=*/nullptr) {
-  impl_.reset(new CastFunctionImpl());
-  impl_->out_type = out_type;
-}
+constexpr char CastOptions::kTypeName[];
 
-CastFunction::~CastFunction() = default;
-
-Type::type CastFunction::out_type_id() const { return impl_->out_type; }
+CastFunction::CastFunction(std::string name, Type::type out_type_id)
+    : ScalarFunction(std::move(name), Arity::Unary(), /*doc=*/nullptr),
+      out_type_id_(out_type_id) {}
 
 Status CastFunction::AddKernel(Type::type in_type_id, ScalarKernel kernel) {
   // We use the same KernelInit for every cast
   kernel.init = internal::CastState::Init;
   RETURN_NOT_OK(ScalarFunction::AddKernel(kernel));
-  impl_->in_types.insert(static_cast<int>(in_type_id));
+  in_type_ids_.push_back(in_type_id);
   return Status::OK();
 }
 
@@ -159,19 +175,10 @@ Status CastFunction::AddKernel(Type::type in_type_id, std::vector<InputType> in_
   return AddKernel(in_type_id, std::move(kernel));
 }
 
-bool CastFunction::CanCastTo(const DataType& out_type) const {
-  return impl_->in_types.find(static_cast<int>(out_type.id())) != impl_->in_types.end();
-}
-
 Result<const Kernel*> CastFunction::DispatchExact(
     const std::vector<ValueDescr>& values) const {
-  const int passed_num_args = static_cast<int>(values.size());
+  RETURN_NOT_OK(CheckArity(values));
 
-  // Validate arity
-  if (passed_num_args != 1) {
-    return Status::Invalid("Cast functions accept 1 argument but passed ",
-                           passed_num_args);
-  }
   std::vector<const ScalarKernel*> candidate_kernels;
   for (const auto& kernel : kernels_) {
     if (kernel.signature->MatchesInputs(values)) {
@@ -181,25 +188,28 @@ Result<const Kernel*> CastFunction::DispatchExact(
 
   if (candidate_kernels.size() == 0) {
     return Status::NotImplemented("Unsupported cast from ", values[0].type->ToString(),
-                                  " to ", ToTypeName(impl_->out_type), " using function ",
+                                  " to ", ToTypeName(out_type_id_), " using function ",
                                   this->name());
-  } else if (candidate_kernels.size() == 1) {
+  }
+
+  if (candidate_kernels.size() == 1) {
     // One match, return it
     return candidate_kernels[0];
-  } else {
-    // Now we are in a casting scenario where we may have both a EXACT_TYPE and
-    // a SAME_TYPE_ID. So we will see if there is an exact match among the
-    // candidate kernels and if not we will just return the first one
-    for (auto kernel : candidate_kernels) {
-      const InputType& arg0 = kernel->signature->in_types()[0];
-      if (arg0.kind() == InputType::EXACT_TYPE) {
-        // Bingo. Return it
-        return kernel;
-      }
-    }
-    // We didn't find an exact match. So just return some kernel that matches
-    return candidate_kernels[0];
   }
+
+  // Now we are in a casting scenario where we may have both a EXACT_TYPE and
+  // a SAME_TYPE_ID. So we will see if there is an exact match among the
+  // candidate kernels and if not we will just return the first one
+  for (auto kernel : candidate_kernels) {
+    const InputType& arg0 = kernel->signature->in_types()[0];
+    if (arg0.kind() == InputType::EXACT_TYPE) {
+      // Bingo. Return it
+      return kernel;
+    }
+  }
+
+  // We didn't find an exact match. So just return some kernel that matches
+  return candidate_kernels[0];
 }
 
 Result<Datum> Cast(const Datum& value, const CastOptions& options, ExecContext* ctx) {
@@ -225,13 +235,37 @@ Result<std::shared_ptr<CastFunction>> GetCastFunction(
 }
 
 bool CanCast(const DataType& from_type, const DataType& to_type) {
-  // TODO
   internal::EnsureInitCastTable();
-  auto it = internal::g_cast_table.find(static_cast<int>(from_type.id()));
+  auto it = internal::g_cast_table.find(static_cast<int>(to_type.id()));
   if (it == internal::g_cast_table.end()) {
     return false;
   }
-  return it->second->CanCastTo(to_type);
+
+  const CastFunction* function = it->second.get();
+  DCHECK_EQ(function->out_type_id(), to_type.id());
+
+  for (auto from_id : function->in_type_ids()) {
+    // XXX should probably check the output type as well
+    if (from_type.id() == from_id) return true;
+  }
+
+  return false;
+}
+
+Result<std::vector<Datum>> Cast(std::vector<Datum> datums, std::vector<ValueDescr> descrs,
+                                ExecContext* ctx) {
+  for (size_t i = 0; i != datums.size(); ++i) {
+    if (descrs[i] != datums[i].descr()) {
+      if (descrs[i].shape != datums[i].shape()) {
+        return Status::NotImplemented("casting between Datum shapes");
+      }
+
+      ARROW_ASSIGN_OR_RAISE(datums[i],
+                            Cast(datums[i], CastOptions::Safe(descrs[i].type), ctx));
+    }
+  }
+
+  return datums;
 }
 
 }  // namespace compute

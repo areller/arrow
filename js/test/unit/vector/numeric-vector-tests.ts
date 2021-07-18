@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+/* eslint-disable jest/no-identical-title */
+
 import {
     util,
     Data, Vector,
@@ -23,12 +25,12 @@ import {
     FloatVector, Float16Vector, Float32Vector, Float64Vector,
     IntVector, Int8Vector, Int16Vector, Int32Vector, Int64Vector,
     Uint8Vector, Uint16Vector, Uint32Vector, Uint64Vector,
-} from '../../Arrow';
+} from 'apache-arrow';
 
 const { float64ToUint16, uint16ToFloat64 } = util;
-import { VectorType as V } from '../../../src/interfaces';
-import { TypedArray, TypedArrayConstructor } from '../../../src/interfaces';
-import { BigIntArray, BigIntArrayConstructor } from '../../../src/interfaces';
+import { VectorType as V } from 'apache-arrow/interfaces';
+import { TypedArray, TypedArrayConstructor } from 'apache-arrow/interfaces';
+import { BigIntArray, BigIntArrayConstructor } from 'apache-arrow/interfaces';
 
 const { joinUint8Arrays, BN } = util;
 const uint16ToFloat64Array = (b: ArrayBuffer) => new Float64Array([...new Uint16Array(b)].map(uint16ToFloat64));
@@ -492,8 +494,8 @@ function indexof_returns_expected_values<T extends Int | Float>(vector: Vector<T
         const stride = vector.stride;
         const BPE = vector.ArrayType.BYTES_PER_ELEMENT;
         const isBigInt = typeof values[0] === 'bigint';
-        const isInt64 = vector.type.compareTo(new Int64());
-        const isFloat16 = vector.type.compareTo(new Float16());
+        const isInt64 = util.compareTypes(vector.type, new Int64());
+        const isFloat16 = util.compareTypes(vector.type, new Float16());
 
         // Create a few random values
         let missing: any = new vector.ArrayType(randomBytes(8 * 2 * BPE));

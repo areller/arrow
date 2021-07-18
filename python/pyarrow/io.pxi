@@ -27,6 +27,7 @@ import threading
 import time
 import warnings
 from io import BufferedIOBase, IOBase, TextIOBase, UnsupportedOperation
+from queue import Queue, Empty as QueueEmpty
 
 from pyarrow.util import _is_path_like, _stringify_path
 
@@ -39,6 +40,46 @@ DEFAULT_BUFFER_SIZE = 2 ** 16
 cdef extern from "Python.h":
     PyObject* PyBytes_FromStringAndSizeNative" PyBytes_FromStringAndSize"(
         char *v, Py_ssize_t len) except NULL
+
+
+def io_thread_count():
+    """
+    Return the number of threads to use for I/O operations.
+
+    Many operations, such as scanning a dataset, will implicitly make
+    use of this pool. The number of threads is set to a fixed value at
+    startup. It can be modified at runtime by calling
+    :func:`set_io_thread_count()`.
+
+    See Also
+    --------
+    set_io_thread_count : Modify the size of this pool.
+    cpu_count : The analogous function for the CPU thread pool.
+    """
+    return GetIOThreadPoolCapacity()
+
+
+def set_io_thread_count(int count):
+    """
+    Set the number of threads to use for I/O operations.
+
+    Many operations, such as scanning a dataset, will implicitly make
+    use of this pool.
+
+    Parameters
+    ----------
+    count : int
+        The max number of threads that may be used for I/O.
+        Must be positive.
+
+    See Also
+    --------
+    io_thread_count : Get the size of this pool.
+    set_cpu_count : The analogous function for the CPU thread pool.
+    """
+    if count < 1:
+        raise ValueError("IO thread count must be strictly positive")
+    check_status(SetIOThreadPoolCapacity(count))
 
 
 cdef class NativeFile(_Weakrefable):
@@ -188,6 +229,24 @@ cdef class NativeFile(_Weakrefable):
             size = GetResultValue(handle.get().GetSize())
 
         return size
+
+    def metadata(self):
+        """
+        Return file metadata
+        """
+        cdef:
+            shared_ptr[const CKeyValueMetadata] c_metadata
+
+        handle = self.get_input_stream()
+        with nogil:
+            c_metadata = GetResultValue(handle.get().ReadMetadata())
+
+        metadata = {}
+        if c_metadata.get() != nullptr:
+            for i in range(c_metadata.get().size()):
+                metadata[frombytes(c_metadata.get().key(i))] = \
+                    c_metadata.get().value(i)
+        return metadata
 
     def tell(self):
         """
@@ -1223,21 +1282,20 @@ cdef class CompressedOutputStream(NativeFile):
 
     Parameters
     ----------
-    stream : pa.NativeFile
+    stream : string, path, pa.NativeFile, or file-like object
         Input stream object to wrap with the compression.
     compression : str
         The compression type ("bz2", "brotli", "gzip", "lz4" or "zstd").
     """
 
-    def __init__(self, NativeFile stream, str compression not None):
+    def __init__(self, object stream, str compression not None):
         cdef:
             Codec codec = Codec(compression)
+            shared_ptr[COutputStream] c_writer
             shared_ptr[CCompressedOutputStream] compressed_stream
+        get_writer(stream, &c_writer)
         compressed_stream = GetResultValue(
-            CCompressedOutputStream.Make(
-                codec.unwrap(),
-                stream.get_output_stream()
-            )
+            CCompressedOutputStream.Make(codec.unwrap(), c_writer)
         )
         self.set_output_stream(<shared_ptr[COutputStream]> compressed_stream)
         self.is_writable = True

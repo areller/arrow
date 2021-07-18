@@ -17,7 +17,6 @@
 
 # cython: profile=False
 # distutils: language = c++
-# cython: embedsignature = True
 
 import io
 from textwrap import indent
@@ -95,6 +94,14 @@ cdef class Statistics(_Weakrefable):
     @property
     def has_min_max(self):
         return self.statistics.get().HasMinMax()
+
+    @property
+    def has_null_count(self):
+        return self.statistics.get().HasNullCount()
+
+    @property
+    def has_distinct_count(self):
+        return self.statistics.get().HasDistinctCount()
 
     @property
     def min_raw(self):
@@ -809,7 +816,7 @@ cdef physical_type_name_from_enum(ParquetType type_):
 
 cdef logical_type_name_from_enum(ParquetLogicalTypeId type_):
     return {
-        ParquetLogicalType_UNKNOWN: 'UNKNOWN',
+        ParquetLogicalType_UNDEFINED: 'UNDEFINED',
         ParquetLogicalType_STRING: 'STRING',
         ParquetLogicalType_MAP: 'MAP',
         ParquetLogicalType_LIST: 'LIST',
@@ -919,9 +926,9 @@ cdef class ParquetReader(_Weakrefable):
         self.pool = maybe_unbox_memory_pool(memory_pool)
         self._metadata = None
 
-    def open(self, object source, bint use_memory_map=True,
+    def open(self, object source not None, bint use_memory_map=True,
              read_dictionary=None, FileMetaData metadata=None,
-             int buffer_size=0):
+             int buffer_size=0, bint pre_buffer=False):
         cdef:
             shared_ptr[CRandomAccessFile] rd_handle
             shared_ptr[CFileMetaData] c_metadata
@@ -941,6 +948,8 @@ cdef class ParquetReader(_Weakrefable):
             properties.disable_buffered_stream()
         else:
             raise ValueError('Buffer size must be larger than zero')
+
+        arrow_props.set_pre_buffer(pre_buffer)
 
         self.source = source
 
@@ -1265,7 +1274,8 @@ cdef shared_ptr[ArrowWriterProperties] _create_arrow_writer_properties(
         use_deprecated_int96_timestamps=False,
         coerce_timestamps=None,
         allow_truncated_timestamps=False,
-        writer_engine_version=None) except *:
+        writer_engine_version=None,
+        use_compliant_nested_type=False) except *:
     """Arrow writer properties"""
     cdef:
         shared_ptr[ArrowWriterProperties] arrow_properties
@@ -1299,6 +1309,13 @@ cdef shared_ptr[ArrowWriterProperties] _create_arrow_writer_properties(
     else:
         arrow_props.disallow_truncated_timestamps()
 
+    # use_compliant_nested_type
+
+    if use_compliant_nested_type:
+        arrow_props.enable_compliant_nested_types()
+    else:
+        arrow_props.disable_compliant_nested_types()
+
     # writer_engine_version
 
     if writer_engine_version == "V1":
@@ -1328,6 +1345,7 @@ cdef class ParquetWriter(_Weakrefable):
         object compression
         object compression_level
         object data_page_version
+        object use_compliant_nested_type
         object version
         object write_statistics
         object writer_engine_version
@@ -1345,7 +1363,8 @@ cdef class ParquetWriter(_Weakrefable):
                   compression_level=None,
                   use_byte_stream_split=False,
                   writer_engine_version=None,
-                  data_page_version=None):
+                  data_page_version=None,
+                  use_compliant_nested_type=False):
         cdef:
             shared_ptr[WriterProperties] properties
             shared_ptr[ArrowWriterProperties] arrow_properties
@@ -1377,7 +1396,8 @@ cdef class ParquetWriter(_Weakrefable):
             use_deprecated_int96_timestamps=use_deprecated_int96_timestamps,
             coerce_timestamps=coerce_timestamps,
             allow_truncated_timestamps=allow_truncated_timestamps,
-            writer_engine_version=writer_engine_version
+            writer_engine_version=writer_engine_version,
+            use_compliant_nested_type=use_compliant_nested_type
         )
 
         pool = maybe_unbox_memory_pool(memory_pool)

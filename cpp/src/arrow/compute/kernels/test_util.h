@@ -19,13 +19,14 @@
 
 // IWYU pragma: begin_exports
 
+#include <gmock/gmock.h>
+
 #include <memory>
 #include <string>
 #include <vector>
 
-#include <gmock/gmock.h>
-
 #include "arrow/array.h"
+#include "arrow/compute/kernel.h"
 #include "arrow/datum.h"
 #include "arrow/memory_pool.h"
 #include "arrow/pretty_print.h"
@@ -34,8 +35,6 @@
 #include "arrow/testing/util.h"
 #include "arrow/type.h"
 
-#include "arrow/compute/kernel.h"
-
 // IWYU pragma: end_exports
 
 namespace arrow {
@@ -43,6 +42,8 @@ namespace arrow {
 using internal::checked_cast;
 
 namespace compute {
+
+using DatumVector = std::vector<Datum>;
 
 template <typename Type, typename T>
 std::shared_ptr<Array> _MakeArray(const std::shared_ptr<DataType>& type,
@@ -57,38 +58,12 @@ std::shared_ptr<Array> _MakeArray(const std::shared_ptr<DataType>& type,
   return result;
 }
 
-template <typename Type, typename Enable = void>
-struct DatumEqual {};
+void CheckScalar(std::string func_name, const ScalarVector& inputs,
+                 std::shared_ptr<Scalar> expected,
+                 const FunctionOptions* options = nullptr);
 
-template <typename Type>
-struct DatumEqual<Type, enable_if_floating_point<Type>> {
-  static constexpr double kArbitraryDoubleErrorBound = 1.0;
-  using ScalarType = typename TypeTraits<Type>::ScalarType;
-
-  static void EnsureEqual(const Datum& lhs, const Datum& rhs) {
-    ASSERT_EQ(lhs.kind(), rhs.kind());
-    if (lhs.kind() == Datum::SCALAR) {
-      auto left = checked_cast<const ScalarType*>(lhs.scalar().get());
-      auto right = checked_cast<const ScalarType*>(rhs.scalar().get());
-      ASSERT_EQ(left->is_valid, right->is_valid);
-      ASSERT_EQ(left->type->id(), right->type->id());
-      ASSERT_NEAR(left->value, right->value, kArbitraryDoubleErrorBound);
-    }
-  }
-};
-
-template <typename Type>
-struct DatumEqual<Type, enable_if_integer<Type>> {
-  using ScalarType = typename TypeTraits<Type>::ScalarType;
-  static void EnsureEqual(const Datum& lhs, const Datum& rhs) {
-    ASSERT_EQ(lhs.kind(), rhs.kind());
-    if (lhs.kind() == Datum::SCALAR) {
-      auto left = checked_cast<const ScalarType*>(lhs.scalar().get());
-      auto right = checked_cast<const ScalarType*>(rhs.scalar().get());
-      ASSERT_EQ(*left, *right);
-    }
-  }
-};
+void CheckScalar(std::string func_name, const DatumVector& inputs, Datum expected,
+                 const FunctionOptions* options = nullptr);
 
 void CheckScalarUnary(std::string func_name, std::shared_ptr<DataType> in_ty,
                       std::string json_input, std::shared_ptr<DataType> out_ty,
@@ -113,8 +88,20 @@ void CheckScalarBinary(std::string func_name, std::shared_ptr<Array> left_input,
                        std::shared_ptr<Array> expected,
                        const FunctionOptions* options = nullptr);
 
+void CheckScalarBinary(std::string func_name, std::shared_ptr<Array> left_input,
+                       std::shared_ptr<Scalar> right_input,
+                       std::shared_ptr<Array> expected,
+                       const FunctionOptions* options = nullptr);
+
+void CheckScalarBinary(std::string func_name, std::shared_ptr<Scalar> left_input,
+                       std::shared_ptr<Array> right_input,
+                       std::shared_ptr<Array> expected,
+                       const FunctionOptions* options = nullptr);
+
 void CheckVectorUnary(std::string func_name, Datum input, std::shared_ptr<Array> expected,
                       const FunctionOptions* options = nullptr);
+
+void ValidateOutput(const Datum& output);
 
 using BinaryTypes =
     ::testing::Types<BinaryType, LargeBinaryType, StringType, LargeStringType>;
@@ -141,6 +128,36 @@ void TestRandomPrimitiveCTypes() {
   DoTestFunctor<TimestampType>::Test(timestamp(TimeUnit::SECOND));
   DoTestFunctor<TimestampType>::Test(timestamp(TimeUnit::MICRO));
   DoTestFunctor<DurationType>::Test(duration(TimeUnit::MILLI));
+}
+
+// Check that DispatchBest on a given function yields the same Kernel as
+// produced by DispatchExact on another set of ValueDescrs.
+void CheckDispatchBest(std::string func_name, std::vector<ValueDescr> descrs,
+                       std::vector<ValueDescr> exact_descrs);
+
+// Check that function fails to produce a Kernel for the set of ValueDescrs.
+void CheckDispatchFails(std::string func_name, std::vector<ValueDescr> descrs);
+
+// Helper to get a default instance of a type, including parameterized types
+template <typename T>
+enable_if_parameter_free<T, std::shared_ptr<DataType>> default_type_instance() {
+  return TypeTraits<T>::type_singleton();
+}
+template <typename T>
+enable_if_time<T, std::shared_ptr<DataType>> default_type_instance() {
+  // Time32 requires second/milli, Time64 requires nano/micro
+  if (bit_width(T::type_id) == 32) {
+    return std::make_shared<T>(TimeUnit::type::SECOND);
+  }
+  return std::make_shared<T>(TimeUnit::type::NANO);
+}
+template <typename T>
+enable_if_timestamp<T, std::shared_ptr<DataType>> default_type_instance() {
+  return std::make_shared<T>(TimeUnit::type::SECOND);
+}
+template <typename T>
+enable_if_decimal<T, std::shared_ptr<DataType>> default_type_instance() {
+  return std::make_shared<T>(5, 2);
 }
 
 }  // namespace compute

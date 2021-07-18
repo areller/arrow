@@ -144,11 +144,65 @@ std::shared_ptr<arrow::compute::FunctionOptions> make_compute_options(
     return out;
   }
 
-  if (func_name == "min_max") {
-    using Options = arrow::compute::MinMaxOptions;
+  if (func_name == "array_sort_indices") {
+    using Order = arrow::compute::SortOrder;
+    using Options = arrow::compute::ArraySortOptions;
+    // false means descending, true means ascending
+    auto order = cpp11::as_cpp<bool>(options["order"]);
+    auto out =
+        std::make_shared<Options>(Options(order ? Order::Descending : Order::Ascending));
+    return out;
+  }
+
+  if (func_name == "sort_indices") {
+    using Key = arrow::compute::SortKey;
+    using Order = arrow::compute::SortOrder;
+    using Options = arrow::compute::SortOptions;
+    auto names = cpp11::as_cpp<std::vector<std::string>>(options["names"]);
+    // false means descending, true means ascending
+    // cpp11 does not support bool here so use int
+    auto orders = cpp11::as_cpp<std::vector<int>>(options["orders"]);
+    std::vector<Key> keys;
+    for (size_t i = 0; i < names.size(); i++) {
+      keys.push_back(
+          Key(names[i], (orders[i] > 0) ? Order::Descending : Order::Ascending));
+    }
+    auto out = std::make_shared<Options>(Options(keys));
+    return out;
+  }
+
+  if (func_name == "min_max" || func_name == "sum" || func_name == "mean" ||
+      func_name == "count" || func_name == "any" || func_name == "all") {
+    using Options = arrow::compute::ScalarAggregateOptions;
     auto out = std::make_shared<Options>(Options::Defaults());
-    out->null_handling =
-        cpp11::as_cpp<bool>(options["na.rm"]) ? Options::SKIP : Options::EMIT_NULL;
+    out->min_count = cpp11::as_cpp<int>(options["na.min_count"]);
+    out->skip_nulls = cpp11::as_cpp<bool>(options["na.rm"]);
+    return out;
+  }
+
+  if (func_name == "min_element_wise" || func_name == "max_element_wise") {
+    using Options = arrow::compute::ElementWiseAggregateOptions;
+    bool skip_nulls = true;
+    if (!Rf_isNull(options["skip_nulls"])) {
+      skip_nulls = cpp11::as_cpp<bool>(options["skip_nulls"]);
+    }
+    return std::make_shared<Options>(skip_nulls);
+  }
+
+  if (func_name == "quantile") {
+    using Options = arrow::compute::QuantileOptions;
+    auto out = std::make_shared<Options>(Options::Defaults());
+    SEXP q = options["q"];
+    if (!Rf_isNull(q) && TYPEOF(q) == REALSXP) {
+      out->q = cpp11::as_cpp<std::vector<double>>(q);
+    }
+    SEXP interpolation = options["interpolation"];
+    if (!Rf_isNull(interpolation) && TYPEOF(interpolation) == INTSXP &&
+        XLENGTH(interpolation) == 1) {
+      out->interpolation =
+          cpp11::as_cpp<enum arrow::compute::QuantileOptions::Interpolation>(
+              interpolation);
+    }
     return out;
   }
 
@@ -158,8 +212,137 @@ std::shared_ptr<arrow::compute::FunctionOptions> make_compute_options(
                                      cpp11::as_cpp<bool>(options["skip_nulls"]));
   }
 
+  if (func_name == "dictionary_encode") {
+    using Options = arrow::compute::DictionaryEncodeOptions;
+    auto out = std::make_shared<Options>(Options::Defaults());
+    if (!Rf_isNull(options["null_encoding_behavior"])) {
+      out->null_encoding_behavior = cpp11::as_cpp<
+          enum arrow::compute::DictionaryEncodeOptions::NullEncodingBehavior>(
+          options["null_encoding_behavior"]);
+    }
+    return out;
+  }
+
   if (func_name == "cast") {
     return make_cast_options(options);
+  }
+
+  if (func_name == "binary_join_element_wise") {
+    using Options = arrow::compute::JoinOptions;
+    auto out = std::make_shared<Options>(Options::Defaults());
+    if (!Rf_isNull(options["null_handling"])) {
+      out->null_handling =
+          cpp11::as_cpp<enum arrow::compute::JoinOptions::NullHandlingBehavior>(
+              options["null_handling"]);
+    }
+    if (!Rf_isNull(options["null_replacement"])) {
+      out->null_replacement = cpp11::as_cpp<std::string>(options["null_replacement"]);
+    }
+    return out;
+  }
+
+  if (func_name == "make_struct") {
+    using Options = arrow::compute::MakeStructOptions;
+    // TODO (ARROW-13371): accept `field_nullability` and `field_metadata` options
+    return std::make_shared<Options>(
+        cpp11::as_cpp<std::vector<std::string>>(options["field_names"]));
+  }
+
+  if (func_name == "match_substring" || func_name == "match_substring_regex" ||
+      func_name == "find_substring" || func_name == "find_substring_regex" ||
+      func_name == "match_like") {
+    using Options = arrow::compute::MatchSubstringOptions;
+    bool ignore_case = false;
+    if (!Rf_isNull(options["ignore_case"])) {
+      ignore_case = cpp11::as_cpp<bool>(options["ignore_case"]);
+    }
+    return std::make_shared<Options>(cpp11::as_cpp<std::string>(options["pattern"]),
+                                     ignore_case);
+  }
+
+  if (func_name == "replace_substring" || func_name == "replace_substring_regex") {
+    using Options = arrow::compute::ReplaceSubstringOptions;
+    int64_t max_replacements = -1;
+    if (!Rf_isNull(options["max_replacements"])) {
+      max_replacements = cpp11::as_cpp<int64_t>(options["max_replacements"]);
+    }
+    return std::make_shared<Options>(cpp11::as_cpp<std::string>(options["pattern"]),
+                                     cpp11::as_cpp<std::string>(options["replacement"]),
+                                     max_replacements);
+  }
+
+  if (func_name == "day_of_week") {
+    using Options = arrow::compute::DayOfWeekOptions;
+    bool one_based_numbering = true;
+    if (!Rf_isNull(options["one_based_numbering"])) {
+      one_based_numbering = cpp11::as_cpp<bool>(options["one_based_numbering"]);
+    }
+    return std::make_shared<Options>(one_based_numbering,
+                                     cpp11::as_cpp<uint32_t>(options["week_start"]));
+  }
+
+  if (func_name == "strptime") {
+    using Options = arrow::compute::StrptimeOptions;
+    return std::make_shared<Options>(
+        cpp11::as_cpp<std::string>(options["format"]),
+        cpp11::as_cpp<arrow::TimeUnit::type>(options["unit"]));
+  }
+
+  if (func_name == "split_pattern" || func_name == "split_pattern_regex") {
+    using Options = arrow::compute::SplitPatternOptions;
+    int64_t max_splits = -1;
+    if (!Rf_isNull(options["max_splits"])) {
+      max_splits = cpp11::as_cpp<int64_t>(options["max_splits"]);
+    }
+    bool reverse = false;
+    if (!Rf_isNull(options["reverse"])) {
+      reverse = cpp11::as_cpp<bool>(options["reverse"]);
+    }
+    return std::make_shared<Options>(cpp11::as_cpp<std::string>(options["pattern"]),
+                                     max_splits, reverse);
+  }
+
+  if (func_name == "utf8_lpad" || func_name == "utf8_rpad" ||
+      func_name == "utf8_center" || func_name == "ascii_lpad" ||
+      func_name == "ascii_rpad" || func_name == "ascii_center") {
+    using Options = arrow::compute::PadOptions;
+    return std::make_shared<Options>(cpp11::as_cpp<int64_t>(options["width"]),
+                                     cpp11::as_cpp<std::string>(options["padding"]));
+  }
+
+  if (func_name == "utf8_split_whitespace" || func_name == "ascii_split_whitespace") {
+    using Options = arrow::compute::SplitOptions;
+    int64_t max_splits = -1;
+    if (!Rf_isNull(options["max_splits"])) {
+      max_splits = cpp11::as_cpp<int64_t>(options["max_splits"]);
+    }
+    bool reverse = false;
+    if (!Rf_isNull(options["reverse"])) {
+      reverse = cpp11::as_cpp<bool>(options["reverse"]);
+    }
+    return std::make_shared<Options>(max_splits, reverse);
+  }
+
+  if (func_name == "utf8_slice_codeunits") {
+    using Options = arrow::compute::SliceOptions;
+
+    int64_t step = 1;
+    if (!Rf_isNull(options["step"])) {
+      step = cpp11::as_cpp<int64_t>(options["step"]);
+    }
+
+    int64_t stop = std::numeric_limits<int32_t>::max();
+    if (!Rf_isNull(options["stop"])) {
+      stop = cpp11::as_cpp<int64_t>(options["stop"]);
+    }
+
+    return std::make_shared<Options>(cpp11::as_cpp<int64_t>(options["start"]), stop,
+                                     step);
+  }
+
+  if (func_name == "variance" || func_name == "stddev") {
+    using Options = arrow::compute::VarianceOptions;
+    return std::make_shared<Options>(cpp11::as_cpp<int64_t>(options["ddof"]));
   }
 
   return nullptr;
@@ -197,6 +380,34 @@ SEXP compute__CallFunction(std::string func_name, cpp11::list args, cpp11::list 
   auto out = ValueOrStop(
       arrow::compute::CallFunction(func_name, datum_args, opts.get(), gc_context()));
   return from_datum(std::move(out));
+}
+
+// [[arrow::export]]
+SEXP compute__GroupBy(cpp11::list arguments, cpp11::list keys, cpp11::list options) {
+  // options is a list of pairs: string function name, list of options
+
+  std::vector<std::shared_ptr<arrow::compute::FunctionOptions>> keep_alives;
+  std::vector<arrow::compute::internal::Aggregate> aggregates;
+
+  for (cpp11::list name_opts : options) {
+    auto name = cpp11::as_cpp<std::string>(name_opts[0]);
+    auto opts = make_compute_options(name, name_opts[1]);
+
+    aggregates.push_back(
+        arrow::compute::internal::Aggregate{std::move(name), opts.get()});
+    keep_alives.push_back(std::move(opts));
+  }
+
+  auto datum_arguments = arrow::r::from_r_list<arrow::Datum>(arguments);
+  auto datum_keys = arrow::r::from_r_list<arrow::Datum>(keys);
+  auto out = ValueOrStop(arrow::compute::internal::GroupBy(datum_arguments, datum_keys,
+                                                           aggregates, gc_context()));
+  return from_datum(std::move(out));
+}
+
+// [[arrow::export]]
+std::vector<std::string> compute__GetFunctionNames() {
+  return arrow::compute::GetFunctionRegistry()->GetFunctionNames();
 }
 
 #endif

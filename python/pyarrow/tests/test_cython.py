@@ -27,10 +27,15 @@ import pyarrow.tests.util as test_util
 
 
 here = os.path.dirname(os.path.abspath(__file__))
+test_ld_path = os.environ.get('PYARROW_TEST_LD_PATH', '')
+if os.name == 'posix':
+    compiler_opts = ['-std=c++11']
+else:
+    compiler_opts = []
 
 
 setup_template = """if 1:
-    from distutils.core import setup
+    from setuptools import setup
     from Cython.Build import cythonize
 
     import numpy as np
@@ -60,6 +65,20 @@ setup_template = """if 1:
 """
 
 
+def check_cython_example_module(mod):
+    arr = pa.array([1, 2, 3])
+    assert mod.get_array_length(arr) == 3
+    with pytest.raises(TypeError, match="not an array"):
+        mod.get_array_length(None)
+
+    scal = pa.scalar(123)
+    cast_scal = mod.cast_scalar(scal, pa.utf8())
+    assert cast_scal == pa.scalar("123")
+    with pytest.raises(NotImplementedError,
+                       match="casting scalars of type int64 to type list"):
+        mod.cast_scalar(scal, pa.list_(pa.int64()))
+
+
 @pytest.mark.cython
 def test_cython_api(tmpdir):
     """
@@ -68,18 +87,12 @@ def test_cython_api(tmpdir):
     # Fail early if cython is not found
     import cython  # noqa
 
-    test_ld_path = os.environ.get('PYARROW_TEST_LD_PATH', '')
-
     with tmpdir.as_cwd():
         # Set up temporary workspace
         pyx_file = 'pyarrow_cython_example.pyx'
         shutil.copyfile(os.path.join(here, pyx_file),
                         os.path.join(str(tmpdir), pyx_file))
         # Create setup.py file
-        if os.name == 'posix':
-            compiler_opts = ['-std=c++11']
-        else:
-            compiler_opts = []
         setup_code = setup_template.format(pyx_file=pyx_file,
                                            compiler_opts=compiler_opts,
                                            test_ld_path=test_ld_path)
@@ -100,10 +113,7 @@ def test_cython_api(tmpdir):
         sys.path.insert(0, str(tmpdir))
         try:
             mod = __import__('pyarrow_cython_example')
-            arr = pa.array([1, 2, 3])
-            assert mod.get_array_length(arr) == 3
-            with pytest.raises(TypeError, match="not an array"):
-                mod.get_array_length(None)
+            check_cython_example_module(mod)
         finally:
             sys.path = orig_path
 
@@ -130,3 +140,41 @@ def test_cython_api(tmpdir):
         subprocess.check_call([sys.executable, '-c', code],
                               stdout=subprocess.PIPE,
                               env=subprocess_env)
+
+
+@pytest.mark.cython
+def test_visit_strings(tmpdir):
+    with tmpdir.as_cwd():
+        # Set up temporary workspace
+        pyx_file = 'bound_function_visit_strings.pyx'
+        shutil.copyfile(os.path.join(here, pyx_file),
+                        os.path.join(str(tmpdir), pyx_file))
+        # Create setup.py file
+        setup_code = setup_template.format(pyx_file=pyx_file,
+                                           compiler_opts=compiler_opts,
+                                           test_ld_path=test_ld_path)
+        with open('setup.py', 'w') as f:
+            f.write(setup_code)
+
+        subprocess_env = test_util.get_modified_env_with_pythonpath()
+
+        # Compile extension module
+        subprocess.check_call([sys.executable, 'setup.py',
+                               'build_ext', '--inplace'],
+                              env=subprocess_env)
+
+    sys.path.insert(0, str(tmpdir))
+    mod = __import__('bound_function_visit_strings')
+
+    strings = ['a', 'b', 'c']
+    visited = []
+    mod._visit_strings(strings, visited.append)
+
+    assert visited == strings
+
+    with pytest.raises(ValueError, match="wtf"):
+        def raise_on_b(s):
+            if s == 'b':
+                raise ValueError('wtf')
+
+        mod._visit_strings(strings, raise_on_b)

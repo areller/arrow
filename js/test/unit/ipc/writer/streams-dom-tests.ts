@@ -20,7 +20,8 @@ import {
     // generateDictionaryTables
 } from '../../../data/tables';
 
-import { AsyncIterable } from 'ix';
+import { from, as } from 'ix/asynciterable';
+import { tap, flatMap } from 'ix/asynciterable/operators';
 
 import {
     Table,
@@ -29,7 +30,7 @@ import {
     RecordBatchFileWriter,
     RecordBatchJSONWriter,
     RecordBatchStreamWriter,
-} from '../../../Arrow';
+} from 'apache-arrow';
 
 import {
     ArrowIOTestHelper,
@@ -48,9 +49,6 @@ import {
     if (process.env.TEST_DOM_STREAMS !== 'true') {
         return test('not testing DOM streams because process.env.TEST_DOM_STREAMS !== "true"', () => {});
     }
-
-    /* tslint:disable */
-    const { parse: bignumJSONParse } = require('json-bignum');
 
     for (const table of generateRandomTables([10, 20, 30])) {
 
@@ -106,7 +104,7 @@ import {
 
             describe(`RecordBatchJSONWriter`, () => {
 
-                const toJSON = (x: any): { schema: any } => bignumJSONParse(`${Buffer.from(x)}`);
+                const toJSON = (x: any): { schema: any } => JSON.parse(`${Buffer.from(x)}`);
 
                 test('Uint8Array', json.buffer((source) => validate(toJSON(source))));
                 test('Promise<Uint8Array>', json.buffer((source) => validate(Promise.resolve(toJSON(source)))));
@@ -162,7 +160,7 @@ import {
                     test('Promise<stream.Readable>', file.nodeReadableStream(wrapArgInPromise(validate)));
                     test('Promise<ReadableStream>', file.whatwgReadableStream(wrapArgInPromise(validate)));
                     test('Promise<ReadableByteStream>', file.whatwgReadableByteStream(wrapArgInPromise(validate)));
-    
+
                     async function validate(source: any) {
                         const writer = new RecordBatchFileWriter();
                         /* no await */ writer.writeAll(await RecordBatchReader.from(source));
@@ -235,9 +233,9 @@ import {
         it(`should write a stream of tables to the same output stream`, async () => {
 
             const tables = [] as Table[];
-            const stream = AsyncIterable.from(generateRandomTables([10, 20, 30]))
+            const stream: ReadableStream<any> = from(generateRandomTables([10, 20, 30]))
                 // insert some asynchrony
-                .tap({ async next(table: Table) { tables.push(table); await sleep(1); } })
+                .pipe(tap({ async next(table: Table) { tables.push(table); await sleep(1); } }))
                 .pipeThrough(RecordBatchStreamWriter.throughDOM(opts));
 
             for await (const reader of RecordBatchReader.readAll(stream)) {
@@ -246,27 +244,27 @@ import {
                 expect(streamTable).toEqualTable(sourceTable);
             }
 
-            expect(tables.length).toBe(0);
+            expect(tables).toHaveLength(0);
             expect(stream.locked).toBe(false);
         });
 
         it(`should write a stream of record batches to the same output stream`, async () => {
 
             const tables = [] as Table[];
-            const stream = AsyncIterable.from(generateRandomTables([10, 20, 30]))
+            const stream = from(generateRandomTables([10, 20, 30]))
                 // insert some asynchrony
-                .tap({ async next(table: Table) { tables.push(table); await sleep(1); } })
+                .pipe(tap({ async next(table: Table) { tables.push(table); await sleep(1); } }))
                 // flatMap from Table -> RecordBatches[]
-                .flatMap((table) => AsyncIterable.as(table.chunks))
+                .pipe(flatMap((table) => as(table.chunks)))
                 .pipeThrough(RecordBatchStreamWriter.throughDOM(opts));
-    
+
             for await (const reader of RecordBatchReader.readAll(stream)) {
                 const sourceTable = tables.shift()!;
                 const streamTable = await Table.from(reader);
                 expect(streamTable).toEqualTable(sourceTable);
             }
 
-            expect(tables.length).toBe(0);
+            expect(tables).toHaveLength(0);
             expect(stream.locked).toBe(false);
         });
     });

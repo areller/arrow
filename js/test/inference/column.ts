@@ -15,11 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { Data } from '../../src/data';
-import { Field } from '../../src/schema';
-import { Column } from '../../src/column';
-import { Vector } from '../../src/vector';
-import { Bool, Int8, Utf8, List, Dictionary, Struct } from '../../src/type';
+/* eslint-disable jest/no-standalone-expect */
+
+import { Data } from 'apache-arrow/data';
+import { Field } from 'apache-arrow/schema';
+import { Column } from 'apache-arrow/column';
+import { Vector } from 'apache-arrow/vector';
+import { Bool, Int8, Utf8, List, Dictionary, Struct } from 'apache-arrow/type';
 
 const boolType = new Bool();
 const boolVector = Vector.new(Data.Bool(boolType, 0, 10, 0, null, new Uint8Array(2)));

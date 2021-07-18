@@ -95,4 +95,16 @@ std::shared_ptr<arrow::Array> ConstantArrayGenerator::String(int64_t size,
   return ConstantArray<StringType>(size, value);
 }
 
+Result<std::shared_ptr<Array>> ScalarVectorToArray(const ScalarVector& scalars) {
+  if (scalars.empty()) {
+    return Status::NotImplemented("ScalarVectorToArray with no scalars");
+  }
+  std::unique_ptr<arrow::ArrayBuilder> builder;
+  RETURN_NOT_OK(MakeBuilder(default_memory_pool(), scalars[0]->type, &builder));
+  RETURN_NOT_OK(builder->AppendScalars(scalars));
+  std::shared_ptr<Array> out;
+  RETURN_NOT_OK(builder->Finish(&out));
+  return out;
+}
+
 }  // namespace arrow

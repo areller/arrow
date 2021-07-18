@@ -77,6 +77,12 @@ This project follows `Google's C++ Style Guide
 * We relax the line length restriction to 90 characters.
 * We use the ``NULLPTR`` macro in header files (instead of ``nullptr``) defined
   in ``src/arrow/util/macros.h`` to support building C++/CLI (ARROW-1134)
+* We relax the guide's rules regarding structs.  For public headers we should
+  use struct only for objects that are principally simple data containers where
+  it is OK to expose all the internal members and any methods are primarily
+  conveniences.  For private headers the rules are relaxed further and structs
+  can be used where convenient for types that do not need access control even
+  though they may not be simple data containers.
 
 Our continuous integration builds on GitHub Actions run the unit test
 suites on a variety of platforms and configuration, including using
@@ -94,7 +100,7 @@ following checks:
 * Passes various C++ (and others) style checks, checked with the ``lint``
   subcommand to :ref:`Archery <archery>`.
 * CMake files pass style checks, can be fixed by running
-  ``run-cmake-format.py`` from the root of the repository. This requires Python
+  ``archery lint --cmake-format --fix``. This requires Python
   3 and `cmake_format <https://github.com/cheshirekow/cmake_format>`_ (note:
   this currently does not work on Windows)
 

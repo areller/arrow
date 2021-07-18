@@ -13,6 +13,9 @@
 \alias{FileType}
 \alias{ParquetVersionType}
 \alias{MetadataVersion}
+\alias{QuantileInterpolation}
+\alias{NullEncodingBehavior}
+\alias{NullHandlingBehavior}
 \title{Arrow enums}
 \format{
 An object of class \code{TimeUnit::type} (inherits from \code{arrow-enum}) of length 4.
@@ -34,6 +37,12 @@ An object of class \code{FileType} (inherits from \code{arrow-enum}) of length 4
 An object of class \code{ParquetVersionType} (inherits from \code{arrow-enum}) of length 2.
 
 An object of class \code{MetadataVersion} (inherits from \code{arrow-enum}) of length 5.
+
+An object of class \code{QuantileInterpolation} (inherits from \code{arrow-enum}) of length 5.
+
+An object of class \code{NullEncodingBehavior} (inherits from \code{arrow-enum}) of length 2.
+
+An object of class \code{NullHandlingBehavior} (inherits from \code{arrow-enum}) of length 3.
 }
 \usage{
 TimeUnit
@@ -55,6 +64,12 @@ FileType
 ParquetVersionType
 
 MetadataVersion
+
+QuantileInterpolation
+
+NullEncodingBehavior
+
+NullHandlingBehavior
 }
 \description{
 Arrow enums

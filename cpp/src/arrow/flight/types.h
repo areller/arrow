@@ -115,20 +115,12 @@ class ARROW_FLIGHT_EXPORT FlightStatusDetail : public arrow::StatusDetail {
 /// \brief Make an appropriate Arrow status for the given
 /// Flight-specific status.
 ///
-/// \param code The status code.
+/// \param code The Flight status code.
 /// \param message The message for the error.
+/// \param extra_info Optional extra binary info for the error (eg protobuf)
 ARROW_FLIGHT_EXPORT
-Status MakeFlightError(FlightStatusCode code, const std::string& message);
-
-/// \brief Make an appropriate Arrow status for the given
-/// Flight-specific status.
-///
-/// \param code The status code.
-/// \param message The message for the error.
-/// \param extra_info The extra binary info for the error (eg protobuf)
-ARROW_FLIGHT_EXPORT
-Status MakeFlightError(FlightStatusCode code, const std::string& message,
-                       const std::string& extra_info);
+Status MakeFlightError(FlightStatusCode code, std::string message,
+                       std::string extra_info = {});
 
 /// \brief A TLS certificate plus key.
 struct ARROW_FLIGHT_EXPORT CertKeyPair {
@@ -349,6 +341,9 @@ struct ARROW_FLIGHT_EXPORT FlightPayload {
   std::shared_ptr<Buffer> descriptor;
   std::shared_ptr<Buffer> app_metadata;
   ipc::IpcPayload ipc_message;
+
+  /// \brief Check that the payload can be written to the wire.
+  Status Validate() const;
 };
 
 /// \brief Schema result returned after a schema request RPC
@@ -481,6 +476,11 @@ class ARROW_FLIGHT_EXPORT MetadataRecordBatchReader {
   /// \brief Consume entire stream as a Table
   virtual Status ReadAll(std::shared_ptr<Table>* table);
 };
+
+/// \brief Convert a MetadataRecordBatchReader to a regular RecordBatchReader.
+ARROW_FLIGHT_EXPORT
+arrow::Result<std::shared_ptr<RecordBatchReader>> MakeRecordBatchReader(
+    std::shared_ptr<MetadataRecordBatchReader> reader);
 
 /// \brief An interface to write IPC payloads with metadata.
 class ARROW_FLIGHT_EXPORT MetadataRecordBatchWriter : public ipc::RecordBatchWriter {

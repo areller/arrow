@@ -21,13 +21,22 @@
 #include <string>
 
 #include "arrow/csv/options.h"
+#include "arrow/dataset/dataset.h"
 #include "arrow/dataset/file_base.h"
 #include "arrow/dataset/type_fwd.h"
 #include "arrow/dataset/visibility.h"
+#include "arrow/ipc/type_fwd.h"
 #include "arrow/status.h"
+#include "arrow/util/compression.h"
 
 namespace arrow {
 namespace dataset {
+
+constexpr char kCsvTypeName[] = "csv";
+
+/// \addtogroup dataset-file-formats
+///
+/// @{
 
 /// \brief A FileFormat implementation that reads from and writes to Csv files
 class ARROW_DS_EXPORT CsvFileFormat : public FileFormat {
@@ -35,7 +44,7 @@ class ARROW_DS_EXPORT CsvFileFormat : public FileFormat {
   /// Options affecting the parsing of CSV files
   csv::ParseOptions parse_options = csv::ParseOptions::Defaults();
 
-  std::string type_name() const override { return "csv"; }
+  std::string type_name() const override { return kCsvTypeName; }
 
   bool Equals(const FileFormat& other) const override;
 
@@ -45,18 +54,70 @@ class ARROW_DS_EXPORT CsvFileFormat : public FileFormat {
   Result<std::shared_ptr<Schema>> Inspect(const FileSource& source) const override;
 
   /// \brief Open a file for scanning
-  Result<ScanTaskIterator> ScanFile(std::shared_ptr<ScanOptions> options,
-                                    std::shared_ptr<ScanContext> context,
-                                    FileFragment* fragment) const override;
+  Result<ScanTaskIterator> ScanFile(
+      const std::shared_ptr<ScanOptions>& options,
+      const std::shared_ptr<FileFragment>& fragment) const override;
+
+  Result<RecordBatchGenerator> ScanBatchesAsync(
+      const std::shared_ptr<ScanOptions>& scan_options,
+      const std::shared_ptr<FileFragment>& file) const override;
+
+  Future<util::optional<int64_t>> CountRows(
+      const std::shared_ptr<FileFragment>& file, compute::Expression predicate,
+      const std::shared_ptr<ScanOptions>& options) override;
 
   Result<std::shared_ptr<FileWriter>> MakeWriter(
       std::shared_ptr<io::OutputStream> destination, std::shared_ptr<Schema> schema,
-      std::shared_ptr<FileWriteOptions> options) const override {
-    return Status::NotImplemented("writing fragment of CsvFileFormat");
-  }
+      std::shared_ptr<FileWriteOptions> options,
+      fs::FileLocator destination_locator) const override;
 
-  std::shared_ptr<FileWriteOptions> DefaultWriteOptions() override { return NULLPTR; }
+  std::shared_ptr<FileWriteOptions> DefaultWriteOptions() override;
 };
+
+/// \brief Per-scan options for CSV fragments
+struct ARROW_DS_EXPORT CsvFragmentScanOptions : public FragmentScanOptions {
+  std::string type_name() const override { return kCsvTypeName; }
+
+  /// CSV conversion options
+  csv::ConvertOptions convert_options = csv::ConvertOptions::Defaults();
+
+  /// CSV reading options
+  ///
+  /// Note that use_threads is always ignored.
+  csv::ReadOptions read_options = csv::ReadOptions::Defaults();
+};
+
+class ARROW_DS_EXPORT CsvFileWriteOptions : public FileWriteOptions {
+ public:
+  /// Options passed to csv::MakeCSVWriter.
+  std::shared_ptr<csv::WriteOptions> write_options;
+
+ protected:
+  using FileWriteOptions::FileWriteOptions;
+
+  friend class CsvFileFormat;
+};
+
+class ARROW_DS_EXPORT CsvFileWriter : public FileWriter {
+ public:
+  Status Write(const std::shared_ptr<RecordBatch>& batch) override;
+
+ private:
+  CsvFileWriter(std::shared_ptr<io::OutputStream> destination,
+                std::shared_ptr<ipc::RecordBatchWriter> writer,
+                std::shared_ptr<Schema> schema,
+                std::shared_ptr<CsvFileWriteOptions> options,
+                fs::FileLocator destination_locator);
+
+  Status FinishInternal() override;
+
+  std::shared_ptr<io::OutputStream> destination_;
+  std::shared_ptr<ipc::RecordBatchWriter> batch_writer_;
+
+  friend class CsvFileFormat;
+};
+
+/// @}
 
 }  // namespace dataset
 }  // namespace arrow

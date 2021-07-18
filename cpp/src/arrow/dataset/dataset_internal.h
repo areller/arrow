@@ -36,7 +36,7 @@ namespace dataset {
 /// \brief GetFragmentsFromDatasets transforms a vector<Dataset> into a
 /// flattened FragmentIterator.
 inline Result<FragmentIterator> GetFragmentsFromDatasets(const DatasetVector& datasets,
-                                                         Expression predicate) {
+                                                         compute::Expression predicate) {
   // Iterator<Dataset>
   auto datasets_it = MakeVectorIterator(datasets);
 
@@ -52,11 +52,6 @@ inline Result<FragmentIterator> GetFragmentsFromDatasets(const DatasetVector& da
   return MakeFlattenIterator(std::move(fragments_it));
 }
 
-inline RecordBatchIterator IteratorFromReader(
-    const std::shared_ptr<RecordBatchReader>& reader) {
-  return MakeFunctionIterator([reader] { return reader->Next(); });
-}
-
 inline std::shared_ptr<Schema> SchemaFromColumnNames(
     const std::shared_ptr<Schema>& input, const std::vector<std::string>& column_names) {
   std::vector<std::shared_ptr<Field>> columns;
@@ -69,6 +64,58 @@ inline std::shared_ptr<Schema> SchemaFromColumnNames(
 
   return schema(std::move(columns))->WithMetadata(input->metadata());
 }
+
+/// Get fragment scan options of the expected type.
+/// \return Fragment scan options if provided on the scan options, else the default
+///     options if set, else a default-constructed value. If options are provided
+///     but of the wrong type, an error is returned.
+template <typename T>
+arrow::Result<std::shared_ptr<T>> GetFragmentScanOptions(
+    const std::string& type_name, const ScanOptions* scan_options,
+    const std::shared_ptr<FragmentScanOptions>& default_options) {
+  auto source = default_options;
+  if (scan_options && scan_options->fragment_scan_options) {
+    source = scan_options->fragment_scan_options;
+  }
+  if (!source) {
+    return std::make_shared<T>();
+  }
+  if (source->type_name() != type_name) {
+    return Status::Invalid("FragmentScanOptions of type ", source->type_name(),
+                           " were provided for scanning a fragment of type ", type_name);
+  }
+  return internal::checked_pointer_cast<T>(source);
+}
+
+class FragmentDataset : public Dataset {
+ public:
+  FragmentDataset(std::shared_ptr<Schema> schema, FragmentVector fragments)
+      : Dataset(std::move(schema)), fragments_(std::move(fragments)) {}
+
+  std::string type_name() const override { return "fragment"; }
+
+  Result<std::shared_ptr<Dataset>> ReplaceSchema(
+      std::shared_ptr<Schema> schema) const override {
+    return std::make_shared<FragmentDataset>(std::move(schema), fragments_);
+  }
+
+ protected:
+  Result<FragmentIterator> GetFragmentsImpl(compute::Expression predicate) override {
+    // TODO(ARROW-12891) Provide subtree pruning for any vector of fragments
+    FragmentVector fragments;
+    for (const auto& fragment : fragments_) {
+      ARROW_ASSIGN_OR_RAISE(
+          auto simplified_filter,
+          compute::SimplifyWithGuarantee(predicate, fragment->partition_expression()));
+
+      if (simplified_filter.IsSatisfiable()) {
+        fragments.push_back(fragment);
+      }
+    }
+    return MakeVectorIterator(std::move(fragments));
+  }
+  FragmentVector fragments_;
+};
 
 }  // namespace dataset
 }  // namespace arrow

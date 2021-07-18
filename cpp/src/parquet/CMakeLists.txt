@@ -21,24 +21,6 @@ add_custom_target(parquet-benchmarks)
 add_custom_target(parquet-tests)
 add_dependencies(parquet-all parquet parquet-tests parquet-benchmarks)
 
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/.parquetcppversion" PARQUET_VERSION)
-string(REPLACE "\n" "" PARQUET_VERSION "${PARQUET_VERSION}")
-string(REGEX MATCH "^([0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?)" VERSION ${PARQUET_VERSION})
-if(NOT VERSION)
-  message(FATAL_ERROR "invalid .parquetcppversion")
-endif()
-set(PARQUET_VERSION "${PARQUET_VERSION}" PARENT_SCOPE)
-
-string(REGEX
-       REPLACE "^([0-9]+)\.[0-9]+\.[0-9]+(-.+)?$" "\\1" PARQUET_VERSION_MAJOR
-               "${PARQUET_VERSION}")
-string(REGEX
-       REPLACE "^[0-9]+\.([0-9]+)\.[0-9]+(-.+)?$" "\\1" PARQUET_VERSION_MINOR
-               "${PARQUET_VERSION}")
-string(REGEX
-       REPLACE "^[0-9]+\.[0-9]+\.([0-9]+)(-.+)?$" "\\1" PARQUET_VERSION_PATCH
-               "${PARQUET_VERSION}")
-
 function(ADD_PARQUET_TEST REL_TEST_NAME)
   set(one_value_args)
   set(multi_value_args EXTRA_DEPENDENCIES LABELS)
@@ -145,19 +127,15 @@ set(PARQUET_STATIC_TEST_LINK_LIBS ${PARQUET_MIN_TEST_LIBS} parquet_static thrift
 
 #
 # Generated Thrift sources
-set_source_files_properties(src/generated/parquet_types.cpp
-                            src/generated/parquet_types.h
+set_source_files_properties(src/generated/parquet_types.cpp src/generated/parquet_types.h
                             src/generated/parquet_constants.cpp
                             src/generated/parquet_constants.h
-                            PROPERTIES
-                            SKIP_PRECOMPILE_HEADERS
-                            ON
-                            SKIP_UNITY_BUILD_INCLUSION
-                            ON)
+                            PROPERTIES SKIP_PRECOMPILE_HEADERS ON
+                                       SKIP_UNITY_BUILD_INCLUSION ON)
 
 if(NOT MSVC)
-  set_source_files_properties(src/parquet/parquet_types.cpp PROPERTIES COMPILE_FLAGS
-                              -Wno-unused-variable)
+  set_source_files_properties(src/parquet/parquet_types.cpp
+                              PROPERTIES COMPILE_FLAGS -Wno-unused-variable)
 endif()
 
 #
@@ -174,14 +152,13 @@ set(PARQUET_SRCS
     column_reader.cc
     column_scanner.cc
     column_writer.cc
-    deprecated_io.cc
     encoding.cc
-    encryption.cc
+    encryption/encryption.cc
+    encryption/internal_file_decryptor.cc
+    encryption/internal_file_encryptor.cc
     exception.cc
     file_reader.cc
     file_writer.cc
-    internal_file_decryptor.cc
-    internal_file_encryptor.cc
     level_comparison.cc
     level_conversion.cc
     metadata.cc
@@ -201,27 +178,34 @@ if(ARROW_HAVE_RUNTIME_AVX2)
   # AVX2 is used as a proxy for BMI2.
   list(APPEND PARQUET_SRCS level_comparison_avx2.cc level_conversion_bmi2.cc)
   set_source_files_properties(level_comparison_avx2.cc
-                              PROPERTIES
-                              SKIP_PRECOMPILE_HEADERS
-                              ON
-                              COMPILE_FLAGS
-                              "${ARROW_AVX2_FLAG}")
+                              PROPERTIES SKIP_PRECOMPILE_HEADERS ON COMPILE_FLAGS
+                                                                    "${ARROW_AVX2_FLAG}")
   # WARNING: DO NOT BLINDLY COPY THIS CODE FOR OTHER BMI2 USE CASES.
   # This code is always guarded by runtime dispatch which verifies
   # BMI2 is present.  For a very small number of CPUs AVX2 does not
   # imply BMI2.
   set_source_files_properties(level_conversion_bmi2.cc
-                              PROPERTIES
-                              SKIP_PRECOMPILE_HEADERS
-                              ON
-                              COMPILE_FLAGS
-                              "${ARROW_AVX2_FLAG} -DARROW_HAVE_BMI2 -mbmi2")
+                              PROPERTIES SKIP_PRECOMPILE_HEADERS ON
+                                         COMPILE_FLAGS
+                                         "${ARROW_AVX2_FLAG} -DARROW_HAVE_BMI2 -mbmi2")
 endif()
 
 if(PARQUET_REQUIRE_ENCRYPTION)
-  set(PARQUET_SRCS ${PARQUET_SRCS} encryption_internal.cc)
+  set(PARQUET_SRCS ${PARQUET_SRCS} encryption/encryption_internal.cc)
+  # Encryption key management
+  set(PARQUET_SRCS
+      ${PARQUET_SRCS}
+      encryption/crypto_factory.cc
+      encryption/file_key_unwrapper.cc
+      encryption/file_key_wrapper.cc
+      encryption/kms_client.cc
+      encryption/key_material.cc
+      encryption/key_metadata.cc
+      encryption/key_toolkit.cc
+      encryption/key_toolkit_internal.cc
+      encryption/local_wrap_kms_client.cc)
 else()
-  set(PARQUET_SRCS ${PARQUET_SRCS} encryption_internal_nossl.cc)
+  set(PARQUET_SRCS ${PARQUET_SRCS} encryption/encryption_internal_nossl.cc)
 endif()
 
 if(NOT PARQUET_MINIMAL_DEPENDENCY)
@@ -304,12 +288,9 @@ add_dependencies(parquet ${PARQUET_LIBRARIES} thrift::thrift)
 # Thrift requires these definitions for some types that we use
 foreach(LIB_TARGET ${PARQUET_LIBRARIES})
   target_compile_definitions(${LIB_TARGET}
-                             PRIVATE
-                             PARQUET_EXPORTING
-                             PRIVATE
-                             HAVE_INTTYPES_H
-                             PRIVATE
-                             HAVE_NETDB_H)
+                             PRIVATE PARQUET_EXPORTING
+                             PRIVATE HAVE_INTTYPES_H
+                             PRIVATE HAVE_NETDB_H)
   if(WIN32)
     target_compile_definitions(${LIB_TARGET} PRIVATE NOMINMAX)
   else()
@@ -323,6 +304,7 @@ endif()
 
 add_subdirectory(api)
 add_subdirectory(arrow)
+add_subdirectory(encryption)
 
 arrow_install_all_headers("parquet")
 
@@ -334,7 +316,6 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/parquet_version.h"
 add_parquet_test(internals-test
                  SOURCES
                  bloom_filter_test.cc
-                 deprecated_io_test.cc
                  properties_test.cc
                  statistics_test.cc
                  encoding_test.cc
@@ -343,12 +324,8 @@ add_parquet_test(internals-test
                  types_test.cc
                  test_util.cc)
 
-set_source_files_properties(public_api_test.cc
-                            PROPERTIES
-                            SKIP_PRECOMPILE_HEADERS
-                            ON
-                            SKIP_UNITY_BUILD_INCLUSION
-                            ON)
+set_source_files_properties(public_api_test.cc PROPERTIES SKIP_PRECOMPILE_HEADERS ON
+                                                          SKIP_UNITY_BUILD_INCLUSION ON)
 
 add_parquet_test(reader_test
                  SOURCES
@@ -381,9 +358,19 @@ add_parquet_test(arrow-internals-test
 if(PARQUET_REQUIRE_ENCRYPTION)
   add_parquet_test(encryption-test
                    SOURCES
-                   encryption_write_configurations_test.cc
-                   encryption_read_configurations_test.cc
-                   encryption_properties_test.cc
+                   encryption/write_configurations_test.cc
+                   encryption/read_configurations_test.cc
+                   encryption/properties_test.cc
+                   encryption/test_encryption_util.cc
+                   test_util.cc)
+  add_parquet_test(encryption-key-management-test
+                   SOURCES
+                   encryption/key_management_test.cc
+                   encryption/key_metadata_test.cc
+                   encryption/key_wrapping_test.cc
+                   encryption/test_encryption_util.cc
+                   encryption/test_in_memory_kms.cc
+                   encryption/two_level_cache_with_expiration_test.cc
                    test_util.cc)
 endif()
 

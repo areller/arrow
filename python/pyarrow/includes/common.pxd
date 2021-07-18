@@ -110,6 +110,7 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
         c_bool IsCapacityError()
         c_bool IsIndexError()
         c_bool IsSerializationError()
+        c_bool IsCancelled()
 
     cdef cppclass CStatusDetail "arrow::StatusDetail":
         c_string ToString()
@@ -127,6 +128,7 @@ cdef extern from "arrow/result.h" namespace "arrow" nogil:
 
 cdef extern from "arrow/python/common.h" namespace "arrow::py" nogil:
     T GetResultValue[T](CResult[T]) except *
+    cdef function[F] BindFunction[F](void* unbound, object bound, ...)
 
 
 cdef inline object PyObject_to_object(PyObject* o):

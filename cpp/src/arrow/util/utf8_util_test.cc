@@ -65,7 +65,8 @@ class UTF8Test : public ::testing::Test {
   static std::vector<std::string> invalid_sequences_ascii;
 };
 
-std::vector<std::string> UTF8Test::valid_sequences_1 = {"a", "\x7f"};
+std::vector<std::string> UTF8Test::valid_sequences_1 = {"a", "\x7f",
+                                                        std::string("\0", 1)};
 std::vector<std::string> UTF8Test::valid_sequences_2 = {"\xc2\x80", "\xc3\xbf",
                                                         "\xdf\xbf"};
 std::vector<std::string> UTF8Test::valid_sequences_3 = {"\xe0\xa0\x80", "\xe8\x9d\xa5",
@@ -140,13 +141,31 @@ class ASCIIValidationTest : public UTF8Test {};
   }
 }
 
+template <typename ValidationFunc>
+void ValidateWithPrefixes(ValidationFunc&& validate, const std::string& s) {
+  // Exercise SIMD optimizations
+  for (int prefix_size = 1; prefix_size < 64; ++prefix_size) {
+    std::string longer(prefix_size, 'x');
+    longer.append(s);
+    ASSERT_TRUE(validate(longer));
+    longer.append(prefix_size, 'y');
+    ASSERT_TRUE(validate(longer));
+  }
+}
+
 void AssertValidUTF8(const std::string& s) { ASSERT_TRUE(IsValidUTF8(s)); }
 
 void AssertInvalidUTF8(const std::string& s) { ASSERT_TRUE(IsInvalidUTF8(s)); }
 
-void AssertValidASCII(const std::string& s) { ASSERT_TRUE(IsValidASCII(s)); }
+void AssertValidASCII(const std::string& s) {
+  ASSERT_TRUE(IsValidASCII(s));
+  ValidateWithPrefixes(IsValidASCII, s);
+}
 
-void AssertInvalidASCII(const std::string& s) { ASSERT_TRUE(IsInvalidASCII(s)); }
+void AssertInvalidASCII(const std::string& s) {
+  ASSERT_TRUE(IsInvalidASCII(s));
+  ValidateWithPrefixes(IsInvalidASCII, s);
+}
 
 TEST_F(ASCIIValidationTest, AsciiValid) {
   for (const auto& s : valid_sequences_ascii) {
@@ -468,6 +487,26 @@ TEST(UTF8FindIf, Basics) {
 
   CheckOk("", 'b', 0, 0);
   CheckOkUTF8("", U'β', 0, 0);
+}
+
+TEST(UTF8Length, Basics) {
+  auto length = [](const std::string& s) {
+    const auto* p = reinterpret_cast<const uint8_t*>(s.data());
+    return UTF8Length(p, p + s.length());
+  };
+  ASSERT_EQ(length("abcde"), 5);
+  // accented a encoded as a single codepoint
+  ASSERT_EQ(length("\xc3\x81"
+                   "bcde"),
+            5);
+  // accented a encoded as two codepoints via combining character
+  ASSERT_EQ(length("a\xcc\x81"
+                   "bcde"),
+            6);
+  // hiragana a (3 bytes)
+  ASSERT_EQ(length("\xe3\x81\x81"), 1);
+  // raised hands emoji (4 bytes)
+  ASSERT_EQ(length("\xf0\x9f\x99\x8c"), 1);
 }
 
 }  // namespace util

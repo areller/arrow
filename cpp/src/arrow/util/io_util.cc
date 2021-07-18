@@ -22,6 +22,15 @@
 
 #define _FILE_OFFSET_BITS 64
 
+#if defined(sun) || defined(__sun)
+// According to https://bugs.python.org/issue1759169#msg82201, __EXTENSIONS__
+// is the best way to enable modern POSIX APIs, such as posix_madvise(), on Solaris.
+// (see also
+// https://github.com/illumos/illumos-gate/blob/master/usr/src/uts/common/sys/mman.h)
+#undef __EXTENSIONS__
+#define __EXTENSIONS__
+#endif
+
 #include "arrow/util/windows_compatibility.h"  // IWYU pragma: keep
 
 #include <algorithm>
@@ -32,6 +41,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -89,76 +99,6 @@
 namespace arrow {
 
 using internal::checked_cast;
-
-namespace io {
-
-//
-// StdoutStream implementation
-//
-
-StdoutStream::StdoutStream() : pos_(0) { set_mode(FileMode::WRITE); }
-
-Status StdoutStream::Close() { return Status::OK(); }
-
-bool StdoutStream::closed() const { return false; }
-
-Result<int64_t> StdoutStream::Tell() const { return pos_; }
-
-Status StdoutStream::Write(const void* data, int64_t nbytes) {
-  pos_ += nbytes;
-  std::cout.write(reinterpret_cast<const char*>(data), nbytes);
-  return Status::OK();
-}
-
-//
-// StderrStream implementation
-//
-
-StderrStream::StderrStream() : pos_(0) { set_mode(FileMode::WRITE); }
-
-Status StderrStream::Close() { return Status::OK(); }
-
-bool StderrStream::closed() const { return false; }
-
-Result<int64_t> StderrStream::Tell() const { return pos_; }
-
-Status StderrStream::Write(const void* data, int64_t nbytes) {
-  pos_ += nbytes;
-  std::cerr.write(reinterpret_cast<const char*>(data), nbytes);
-  return Status::OK();
-}
-
-//
-// StdinStream implementation
-//
-
-StdinStream::StdinStream() : pos_(0) { set_mode(FileMode::READ); }
-
-Status StdinStream::Close() { return Status::OK(); }
-
-bool StdinStream::closed() const { return false; }
-
-Result<int64_t> StdinStream::Tell() const { return pos_; }
-
-Result<int64_t> StdinStream::Read(int64_t nbytes, void* out) {
-  std::cin.read(reinterpret_cast<char*>(out), nbytes);
-  if (std::cin) {
-    pos_ += nbytes;
-    return nbytes;
-  } else {
-    return 0;
-  }
-}
-
-Result<std::shared_ptr<Buffer>> StdinStream::Read(int64_t nbytes) {
-  ARROW_ASSIGN_OR_RAISE(auto buffer, AllocateResizableBuffer(nbytes));
-  ARROW_ASSIGN_OR_RAISE(int64_t bytes_read, Read(nbytes, buffer->mutable_data()));
-  ARROW_RETURN_NOT_OK(buffer->Resize(bytes_read, false));
-  buffer->ZeroPadding();
-  return std::move(buffer);
-}
-
-}  // namespace io
 
 namespace internal {
 
@@ -304,6 +244,26 @@ class WinErrorDetail : public StatusDetail {
 };
 #endif
 
+const char kSignalDetailTypeId[] = "arrow::SignalDetail";
+
+class SignalDetail : public StatusDetail {
+ public:
+  explicit SignalDetail(int signum) : signum_(signum) {}
+
+  const char* type_id() const override { return kSignalDetailTypeId; }
+
+  std::string ToString() const override {
+    std::stringstream ss;
+    ss << "received signal " << signum_;
+    return ss.str();
+  }
+
+  int signum() const { return signum_; }
+
+ protected:
+  int signum_;
+};
+
 }  // namespace
 
 std::shared_ptr<StatusDetail> StatusDetailFromErrno(int errnum) {
@@ -315,6 +275,10 @@ std::shared_ptr<StatusDetail> StatusDetailFromWinError(int errnum) {
   return std::make_shared<WinErrorDetail>(errnum);
 }
 #endif
+
+std::shared_ptr<StatusDetail> StatusDetailFromSignal(int signum) {
+  return std::make_shared<SignalDetail>(signum);
+}
 
 int ErrnoFromStatus(const Status& status) {
   const auto detail = status.detail();
@@ -331,6 +295,14 @@ int WinErrorFromStatus(const Status& status) {
     return checked_cast<const WinErrorDetail&>(*detail).errnum();
   }
 #endif
+  return 0;
+}
+
+int SignalFromStatus(const Status& status) {
+  const auto detail = status.detail();
+  if (detail != nullptr && detail->type_id() == kSignalDetailTypeId) {
+    return checked_cast<const SignalDetail&>(*detail).signum();
+  }
   return 0;
 }
 
@@ -431,11 +403,18 @@ namespace {
 
 Result<bool> DoCreateDir(const PlatformFilename& dir_path, bool create_parents) {
 #ifdef _WIN32
-  if (CreateDirectoryW(dir_path.ToNative().c_str(), nullptr)) {
+  const auto s = dir_path.ToNative().c_str();
+  if (CreateDirectoryW(s, nullptr)) {
     return true;
   }
   int errnum = GetLastError();
   if (errnum == ERROR_ALREADY_EXISTS) {
+    const auto attrs = GetFileAttributesW(s);
+    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+      // Note we propagate the original error, not the GetFileAttributesW() error
+      return IOErrorFromWinError(ERROR_ALREADY_EXISTS, "Cannot create directory '",
+                                 dir_path.ToString(), "': non-directory entry exists");
+    }
     return false;
   }
   if (create_parents && errnum == ERROR_PATH_NOT_FOUND) {
@@ -448,10 +427,17 @@ Result<bool> DoCreateDir(const PlatformFilename& dir_path, bool create_parents) 
   return IOErrorFromWinError(GetLastError(), "Cannot create directory '",
                              dir_path.ToString(), "'");
 #else
-  if (mkdir(dir_path.ToNative().c_str(), S_IRWXU | S_IRWXG | S_IRWXO) == 0) {
+  const auto s = dir_path.ToNative().c_str();
+  if (mkdir(s, S_IRWXU | S_IRWXG | S_IRWXO) == 0) {
     return true;
   }
   if (errno == EEXIST) {
+    struct stat st;
+    if (stat(s, &st) || !S_ISDIR(st.st_mode)) {
+      // Note we propagate the original errno, not the stat() errno
+      return IOErrorFromErrno(EEXIST, "Cannot create directory '", dir_path.ToString(),
+                              "': non-directory entry exists");
+    }
     return false;
   }
   if (create_parents && errno == ENOENT) {
@@ -1033,8 +1019,16 @@ Status MemoryMapRemap(void* addr, size_t old_size, size_t new_size, int fildes,
     return StatusFromMmapErrno("MapViewOfFile failed");
   }
   return Status::OK();
+#elif defined(__linux__)
+  if (ftruncate(fildes, new_size) == -1) {
+    return StatusFromMmapErrno("ftruncate failed");
+  }
+  *new_addr = mremap(addr, old_size, new_size, MREMAP_MAYMOVE);
+  if (*new_addr == MAP_FAILED) {
+    return StatusFromMmapErrno("mremap failed");
+  }
+  return Status::OK();
 #else
-#if defined(__APPLE__) || defined(__FreeBSD__)
   // we have to close the mmap first, truncate the file to the new size
   // and recreate the mmap
   if (munmap(addr, old_size) == -1) {
@@ -1050,16 +1044,6 @@ Status MemoryMapRemap(void* addr, size_t old_size, size_t new_size, int fildes,
     return StatusFromMmapErrno("mmap failed");
   }
   return Status::OK();
-#else
-  if (ftruncate(fildes, new_size) == -1) {
-    return StatusFromMmapErrno("ftruncate failed");
-  }
-  *new_addr = mremap(addr, old_size, new_size, MREMAP_MAYMOVE);
-  if (*new_addr == MAP_FAILED) {
-    return StatusFromMmapErrno("mremap failed");
-  }
-  return Status::OK();
-#endif
 #endif
 }
 
@@ -1105,7 +1089,7 @@ Status MemoryAdviseWillNeed(const std::vector<MemoryRegion>& regions) {
     }
   }
   return Status::OK();
-#else
+#elif defined(POSIX_MADV_WILLNEED)
   for (const auto& region : regions) {
     if (region.size != 0) {
       const auto aligned = align_region(region);
@@ -1118,6 +1102,8 @@ Status MemoryAdviseWillNeed(const std::vector<MemoryRegion>& regions) {
       }
     }
   }
+  return Status::OK();
+#else
   return Status::OK();
 #endif
 }
@@ -1608,6 +1594,39 @@ Result<SignalHandler> SetSignalHandler(int signum, const SignalHandler& handler)
   return Status::OK();
 }
 
+void ReinstateSignalHandler(int signum, SignalHandler::Callback handler) {
+#if !ARROW_HAVE_SIGACTION
+  // Cannot report any errors from signal() (but there shouldn't be any)
+  signal(signum, handler);
+#endif
+}
+
+Status SendSignal(int signum) {
+  if (raise(signum) == 0) {
+    return Status::OK();
+  }
+  if (errno == EINVAL) {
+    return Status::Invalid("Invalid signal number ", signum);
+  }
+  return IOErrorFromErrno(errno, "Failed to raise signal");
+}
+
+Status SendSignalToThread(int signum, uint64_t thread_id) {
+#ifdef _WIN32
+  return Status::NotImplemented("Cannot send signal to specific thread on Windows");
+#else
+  // Have to use a C-style cast because pthread_t can be a pointer *or* integer type
+  int r = pthread_kill((pthread_t)thread_id, signum);  // NOLINT readability-casting
+  if (r == 0) {
+    return Status::OK();
+  }
+  if (r == EINVAL) {
+    return Status::Invalid("Invalid signal number ", signum);
+  }
+  return IOErrorFromErrno(r, "Failed to raise signal");
+#endif
+}
+
 namespace {
 
 int64_t GetPid() {
@@ -1644,6 +1663,22 @@ int64_t GetRandomSeed() {
   // unless truly necessary (it can block on some systems, see ARROW-10287).
   static auto seed_gen = GetSeedGenerator();
   return static_cast<int64_t>(seed_gen());
+}
+
+uint64_t GetThreadId() {
+  uint64_t equiv{0};
+  // std::thread::id is trivially copyable as per C++ spec,
+  // so type punning as a uint64_t should work
+  static_assert(sizeof(std::thread::id) <= sizeof(uint64_t),
+                "std::thread::id can't fit into uint64_t");
+  const auto tid = std::this_thread::get_id();
+  memcpy(&equiv, reinterpret_cast<const void*>(&tid), sizeof(tid));
+  return equiv;
+}
+
+uint64_t GetOptionalThreadId() {
+  auto tid = GetThreadId();
+  return (tid == 0) ? tid - 1 : tid;
 }
 
 }  // namespace internal

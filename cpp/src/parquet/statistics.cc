@@ -41,6 +41,7 @@
 using arrow::default_memory_pool;
 using arrow::MemoryPool;
 using arrow::internal::checked_cast;
+using arrow::util::SafeCopy;
 
 namespace parquet {
 namespace {
@@ -48,9 +49,15 @@ namespace {
 // ----------------------------------------------------------------------
 // Comparator implementations
 
+constexpr int value_length(int value_length, const ByteArray& value) { return value.len; }
+constexpr int value_length(int type_length, const FLBA& value) { return type_length; }
+
 template <typename DType, bool is_signed>
 struct CompareHelper {
   using T = typename DType::c_type;
+
+  static_assert(!std::is_unsigned<T>::value || std::is_same<T, bool>::value,
+                "T is an unsigned numeric");
 
   constexpr static T DefaultMin() { return std::numeric_limits<T>::max(); }
   constexpr static T DefaultMax() { return std::numeric_limits<T>::lowest(); }
@@ -80,12 +87,24 @@ struct UnsignedCompareHelperBase {
   using T = typename DType::c_type;
   using UCType = typename std::make_unsigned<T>::type;
 
-  constexpr static T DefaultMin() { return std::numeric_limits<UCType>::max(); }
-  constexpr static T DefaultMax() { return std::numeric_limits<UCType>::lowest(); }
+  static_assert(!std::is_same<T, UCType>::value, "T is unsigned");
+  static_assert(sizeof(T) == sizeof(UCType), "T and UCType not the same size");
+
+  // NOTE: according to the C++ spec, unsigned-to-signed conversion is
+  // implementation-defined if the original value does not fit in the signed type
+  // (i.e., two's complement cannot be assumed even on mainstream machines,
+  // because the compiler may decide otherwise).  Hence the use of `SafeCopy`
+  // below for deterministic bit-casting.
+  // (see "Integer conversions" in
+  //  https://en.cppreference.com/w/cpp/language/implicit_conversion)
+
+  static const T DefaultMin() { return SafeCopy<T>(std::numeric_limits<UCType>::max()); }
+  static const T DefaultMax() { return 0; }
+
   static T Coalesce(T val, T fallback) { return val; }
 
-  static inline bool Compare(int type_length, T a, T b) {
-    return ::arrow::util::SafeCopy<UCType>(a) < ::arrow::util::SafeCopy<UCType>(b);
+  static bool Compare(int type_length, T a, T b) {
+    return SafeCopy<UCType>(a) < SafeCopy<UCType>(b);
   }
 
   static T Min(int type_length, T a, T b) { return Compare(type_length, a, b) ? a : b; }
@@ -104,12 +123,12 @@ struct CompareHelper<Int96Type, is_signed> {
   using msb_type = typename std::conditional<is_signed, int32_t, uint32_t>::type;
 
   static T DefaultMin() {
-    uint32_t kMsbMax = std::numeric_limits<msb_type>::max();
+    uint32_t kMsbMax = SafeCopy<uint32_t>(std::numeric_limits<msb_type>::max());
     uint32_t kMax = std::numeric_limits<uint32_t>::max();
     return {kMax, kMax, kMsbMax};
   }
   static T DefaultMax() {
-    uint32_t kMsbMin = std::numeric_limits<msb_type>::min();
+    uint32_t kMsbMin = SafeCopy<uint32_t>(std::numeric_limits<msb_type>::min());
     uint32_t kMin = std::numeric_limits<uint32_t>::min();
     return {kMin, kMin, kMsbMin};
   }
@@ -119,8 +138,7 @@ struct CompareHelper<Int96Type, is_signed> {
     if (a.value[2] != b.value[2]) {
       // Only the MSB bit is by Signed comparison. For little-endian, this is the
       // last bit of Int96 type.
-      return ::arrow::util::SafeCopy<msb_type>(a.value[2]) <
-             ::arrow::util::SafeCopy<msb_type>(b.value[2]);
+      return SafeCopy<msb_type>(a.value[2]) < SafeCopy<msb_type>(b.value[2]);
     } else if (a.value[1] != b.value[1]) {
       return (a.value[1] < b.value[1]);
     }
@@ -133,56 +151,110 @@ struct CompareHelper<Int96Type, is_signed> {
   static T Max(int type_length, const T& a, const T& b) {
     return Compare(0, a, b) ? b : a;
   }
-};  // namespace parquet
+};
 
-template <typename DType, bool is_signed>
-struct ByteLikeCompareHelperBase {
-  using T = ByteArrayType::c_type;
-  using PtrType = typename std::conditional<is_signed, int8_t, uint8_t>::type;
+template <typename T, bool is_signed>
+struct BinaryLikeComparer {};
 
-  static T DefaultMin() { return {}; }
-  static T DefaultMax() { return {}; }
-  static T Coalesce(T val, T fallback) { return val; }
-
-  static inline bool Compare(int type_length, const T& a, const T& b) {
-    const auto* aptr = reinterpret_cast<const PtrType*>(a.ptr);
-    const auto* bptr = reinterpret_cast<const PtrType*>(b.ptr);
-    return std::lexicographical_compare(aptr, aptr + a.len, bptr, bptr + b.len);
+template <typename T>
+struct BinaryLikeComparer<T, /*is_signed=*/false> {
+  static bool Compare(int type_length, const T& a, const T& b) {
+    int a_length = value_length(type_length, a);
+    int b_length = value_length(type_length, b);
+    // Unsigned comparison is used for non-numeric types so straight
+    // lexiographic comparison makes sense. (a.ptr is always unsigned)....
+    return std::lexicographical_compare(a.ptr, a.ptr + a_length, b.ptr, b.ptr + b_length);
   }
+};
 
-  static T Min(int type_length, const T& a, const T& b) {
-    if (a.ptr == nullptr) return b;
-    if (b.ptr == nullptr) return a;
-    return Compare(type_length, a, b) ? a : b;
-  }
+template <typename T>
+struct BinaryLikeComparer<T, /*is_signed=*/true> {
+  static bool Compare(int type_length, const T& a, const T& b) {
+    // Is signed is used for integers encoded as big-endian twos
+    // complement integers. (e.g. decimals).
+    int a_length = value_length(type_length, a);
+    int b_length = value_length(type_length, b);
 
-  static T Max(int type_length, const T& a, const T& b) {
-    if (a.ptr == nullptr) return b;
-    if (b.ptr == nullptr) return a;
-    return Compare(type_length, a, b) ? b : a;
+    // At least of the lengths is zero.
+    if (a_length == 0 || b_length == 0) {
+      return a_length == 0 && b_length > 0;
+    }
+
+    int8_t first_a = *a.ptr;
+    int8_t first_b = *b.ptr;
+    // We can short circuit for different signed numbers or
+    // for equal length bytes arrays that have different first bytes.
+    // The equality requirement is necessary for sign extension cases.
+    // 0xFF10 should be eqaul to 0x10 (due to big endian sign extension).
+    if ((0x80 & first_a) != (0x80 & first_b) ||
+        (a_length == b_length && first_a != first_b)) {
+      return first_a < first_b;
+    }
+    // When the lengths are unequal and the numbers are of the same
+    // sign we need to do comparison by sign extending the shorter
+    // value first, and once we get to equal sized arrays, lexicographical
+    // unsigned comparison of everything but the first byte is sufficient.
+    const uint8_t* a_start = a.ptr;
+    const uint8_t* b_start = b.ptr;
+    if (a_length != b_length) {
+      const uint8_t* lead_start = nullptr;
+      const uint8_t* lead_end = nullptr;
+      if (a_length > b_length) {
+        int lead_length = a_length - b_length;
+        lead_start = a.ptr;
+        lead_end = a.ptr + lead_length;
+        a_start += lead_length;
+      } else {
+        DCHECK_LT(a_length, b_length);
+        int lead_length = b_length - a_length;
+        lead_start = b.ptr;
+        lead_end = b.ptr + lead_length;
+        b_start += lead_length;
+      }
+      // Compare extra bytes to the sign extension of the first
+      // byte of the other number.
+      uint8_t extension = first_a < 0 ? 0xFF : 0;
+      bool not_equal = std::any_of(lead_start, lead_end,
+                                   [extension](uint8_t a) { return extension != a; });
+      if (not_equal) {
+        // Since sign extension are extrema values for unsigned bytes:
+        //
+        // Four cases exist:
+        //    negative values:
+        //      b is the longer value.
+        //        b must be the lesser value: return false
+        //      else:
+        //        a must be the lesser value: return true
+        //
+        //    positive values:
+        //      b  is the longer value.
+        //        values in b must be greater than a: return true
+        //      else:
+        //        values in a must be greater than b: return false
+        bool negative_values = first_a < 0;
+        bool b_longer = a_length < b_length;
+        return negative_values != b_longer;
+      }
+    } else {
+      a_start++;
+      b_start++;
+    }
+    return std::lexicographical_compare(a_start, a.ptr + a_length, b_start,
+                                        b.ptr + b_length);
   }
 };
 
 template <typename DType, bool is_signed>
 struct BinaryLikeCompareHelperBase {
   using T = typename DType::c_type;
-  using PtrType = typename std::conditional<is_signed, int8_t, uint8_t>::type;
 
   static T DefaultMin() { return {}; }
   static T DefaultMax() { return {}; }
   static T Coalesce(T val, T fallback) { return val; }
 
-  static int value_length(int value_length, const ByteArray& value) { return value.len; }
-
-  static int value_length(int type_length, const FLBA& value) { return type_length; }
-
   static inline bool Compare(int type_length, const T& a, const T& b) {
-    const auto* aptr = reinterpret_cast<const PtrType*>(a.ptr);
-    const auto* bptr = reinterpret_cast<const PtrType*>(b.ptr);
-    return std::lexicographical_compare(aptr, aptr + value_length(type_length, a), bptr,
-                                        bptr + value_length(type_length, b));
+    return BinaryLikeComparer<T, is_signed>::Compare(type_length, a, b);
   }
-
   static T Min(int type_length, const T& a, const T& b) {
     if (a.ptr == nullptr) return b;
     if (b.ptr == nullptr) return a;
@@ -316,6 +388,28 @@ class TypedComparatorImpl : virtual public TypedComparator<DType> {
  private:
   int type_length_;
 };
+
+// ARROW-11675: A hand-written version of GetMinMax(), to work around
+// what looks like a MSVC code generation bug.
+// This does not seem to be required for GetMinMaxSpaced().
+template <>
+std::pair<int32_t, int32_t>
+TypedComparatorImpl</*is_signed=*/false, Int32Type>::GetMinMax(const int32_t* values,
+                                                               int64_t length) {
+  DCHECK_GT(length, 0);
+
+  const uint32_t* unsigned_values = reinterpret_cast<const uint32_t*>(values);
+  uint32_t min = std::numeric_limits<uint32_t>::max();
+  uint32_t max = std::numeric_limits<uint32_t>::lowest();
+
+  for (int64_t i = 0; i < length; i++) {
+    const auto val = unsigned_values[i];
+    min = std::min<uint32_t>(min, val);
+    max = std::max<uint32_t>(max, val);
+  }
+
+  return {SafeCopy<int32_t>(min), SafeCopy<int32_t>(max)};
+}
 
 template <bool is_signed, typename DType>
 std::pair<typename DType::c_type, typename DType::c_type>

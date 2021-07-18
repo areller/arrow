@@ -25,6 +25,11 @@ import textwrap
 
 import numpy as np
 
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
 import pyarrow as pa
 import pyarrow.compute as pc
 
@@ -106,6 +111,45 @@ def test_exported_option_classes():
                                       param.VAR_KEYWORD)
 
 
+def test_option_class_equality():
+    options = [
+        pc.CastOptions.safe(pa.int8()),
+        pc.ExtractRegexOptions("pattern"),
+        pc.IndexOptions(pa.scalar(1)),
+        pc.MatchSubstringOptions("pattern"),
+        pc.PadOptions(5, " "),
+        pc.PartitionNthOptions(1),
+        pc.MakeStructOptions(["field", "names"]),
+        pc.DayOfWeekOptions(False, 0),
+        pc.ReplaceSliceOptions(start=0, stop=1, replacement="a"),
+        pc.ReplaceSubstringOptions("a", "b"),
+        pc.SetLookupOptions(value_set=pa.array([1])),
+        pc.SliceOptions(start=0, stop=1, step=1),
+        pc.SplitPatternOptions(pattern="pattern"),
+        pc.StrptimeOptions("%Y", "s"),
+        pc.TrimOptions(" "),
+    ]
+    classes = {type(option) for option in options}
+    for cls in exported_option_classes:
+        if cls not in classes:
+            try:
+                options.append(cls())
+            except TypeError:
+                pytest.fail(f"Options class is not tested: {cls}")
+    for option in options:
+        assert option == option
+        assert repr(option).startswith(option.__class__.__name__)
+        buf = option.serialize()
+        deserialized = pc.FunctionOptions.deserialize(buf)
+        assert option == deserialized
+        assert repr(option) == repr(deserialized)
+    for option1, option2 in zip(options, options[1:]):
+        assert option1 != option2
+
+    assert repr(pc.IndexOptions(pa.scalar(1))) == "IndexOptions(value=int64:1)"
+    assert repr(pc.ArraySortOptions()) == "ArraySortOptions(order=Ascending)"
+
+
 def test_list_functions():
     assert len(pc.list_functions()) > 10
     assert "add" in pc.list_functions()
@@ -129,9 +173,14 @@ def test_get_function_vector():
     _check_get_function("unique", pc.VectorFunction, pc.VectorKernel, 8)
 
 
-def test_get_function_aggregate():
+def test_get_function_scalar_aggregate():
     _check_get_function("mean", pc.ScalarAggregateFunction,
                         pc.ScalarAggregateKernel, 8)
+
+
+def test_get_function_hash_aggregate():
+    _check_get_function("hash_sum", pc.HashAggregateFunction,
+                        pc.HashAggregateKernel, 1)
 
 
 def test_call_function_with_memory_pool():
@@ -201,8 +250,20 @@ def test_sum_array(arrow_type):
     assert arr.sum().as_py() == 10
     assert pc.sum(arr).as_py() == 10
 
+    arr = pa.array([1, 2, 3, 4, None], type=arrow_type)
+    assert arr.sum().as_py() == 10
+    assert pc.sum(arr).as_py() == 10
+
+    arr = pa.array([None], type=arrow_type)
+    assert arr.sum().as_py() is None  # noqa: E711
+    assert pc.sum(arr).as_py() is None  # noqa: E711
+    assert arr.sum(min_count=0).as_py() == 0
+    assert pc.sum(arr, min_count=0).as_py() == 0
+
     arr = pa.array([], type=arrow_type)
     assert arr.sum().as_py() is None  # noqa: E711
+    assert arr.sum(min_count=0).as_py() == 0
+    assert pc.sum(arr, min_count=0).as_py() == 0
 
 
 @pytest.mark.parametrize('arrow_type', numerical_arrow_types)
@@ -225,6 +286,7 @@ def test_sum_chunked_array(arrow_type):
     arr = pa.chunked_array((), type=arrow_type)
     assert arr.num_chunks == 0
     assert pc.sum(arr).as_py() is None  # noqa: E711
+    assert pc.sum(arr, min_count=0).as_py() == 0
 
 
 def test_mode_array():
@@ -267,10 +329,93 @@ def test_variance():
     assert pc.variance(data, ddof=1).as_py() == 6.0
 
 
+def test_count_substring():
+    for (ty, offset) in [(pa.string(), pa.int32()),
+                         (pa.large_string(), pa.int64())]:
+        arr = pa.array(["ab", "cab", "abcab", "ba", "AB", None], type=ty)
+
+        result = pc.count_substring(arr, "ab")
+        expected = pa.array([1, 1, 2, 0, 0, None], type=offset)
+        assert expected.equals(result)
+
+        result = pc.count_substring(arr, "ab", ignore_case=True)
+        expected = pa.array([1, 1, 2, 0, 1, None], type=offset)
+        assert expected.equals(result)
+
+
+def test_count_substring_regex():
+    for (ty, offset) in [(pa.string(), pa.int32()),
+                         (pa.large_string(), pa.int64())]:
+        arr = pa.array(["ab", "cab", "baAacaa", "ba", "AB", None], type=ty)
+
+        result = pc.count_substring_regex(arr, "a+")
+        expected = pa.array([1, 1, 3, 1, 0, None], type=offset)
+        assert expected.equals(result)
+
+        result = pc.count_substring_regex(arr, "a+", ignore_case=True)
+        expected = pa.array([1, 1, 2, 1, 1, None], type=offset)
+        assert expected.equals(result)
+
+
+def test_find_substring():
+    for ty in [pa.string(), pa.binary(), pa.large_string(), pa.large_binary()]:
+        arr = pa.array(["ab", "cab", "ba", None], type=ty)
+        result = pc.find_substring(arr, "ab")
+        assert result.to_pylist() == [0, 1, -1, None]
+
+        result = pc.find_substring_regex(arr, "a?b")
+        assert result.to_pylist() == [0, 1, 0, None]
+
+        arr = pa.array(["ab*", "cAB*", "ba", "aB?"], type=ty)
+        result = pc.find_substring(arr, "aB*", ignore_case=True)
+        assert result.to_pylist() == [0, 1, -1, -1]
+
+        result = pc.find_substring_regex(arr, "a?b", ignore_case=True)
+        assert result.to_pylist() == [0, 1, 0, 0]
+
+
+def test_match_like():
+    arr = pa.array(["ab", "ba%", "ba", "ca%d", None])
+    result = pc.match_like(arr, r"_a\%%")
+    expected = pa.array([False, True, False, True, None])
+    assert expected.equals(result)
+
+    arr = pa.array(["aB", "bA%", "ba", "ca%d", None])
+    result = pc.match_like(arr, r"_a\%%", ignore_case=True)
+    expected = pa.array([False, True, False, True, None])
+    assert expected.equals(result)
+    result = pc.match_like(arr, r"_a\%%", ignore_case=False)
+    expected = pa.array([False, False, False, True, None])
+    assert expected.equals(result)
+
+
 def test_match_substring():
     arr = pa.array(["ab", "abc", "ba", None])
     result = pc.match_substring(arr, "ab")
     expected = pa.array([True, True, False, None])
+    assert expected.equals(result)
+
+    arr = pa.array(["áB", "Ábc", "ba", None])
+    result = pc.match_substring(arr, "áb", ignore_case=True)
+    expected = pa.array([True, True, False, None])
+    assert expected.equals(result)
+    result = pc.match_substring(arr, "áb", ignore_case=False)
+    expected = pa.array([False, False, False, None])
+    assert expected.equals(result)
+
+
+def test_match_substring_regex():
+    arr = pa.array(["ab", "abc", "ba", "c", None])
+    result = pc.match_substring_regex(arr, "^a?b")
+    expected = pa.array([True, True, True, False, None])
+    assert expected.equals(result)
+
+    arr = pa.array(["aB", "Abc", "BA", "c", None])
+    result = pc.match_substring_regex(arr, "^a?b", ignore_case=True)
+    expected = pa.array([True, True, True, False, None])
+    assert expected.equals(result)
+    result = pc.match_substring_regex(arr, "^a?b", ignore_case=False)
+    expected = pa.array([False, False, False, False, None])
     assert expected.equals(result)
 
 
@@ -290,6 +435,18 @@ def test_trim():
     result = pc.utf8_trim(arr, characters=' f\u3000')
     expected = pa.array(["oo", None, "oo bar \t"])
     assert expected.equals(result)
+
+
+def test_slice_compatibility():
+    arr = pa.array(["", "𝑓", "𝑓ö", "𝑓öõ", "𝑓öõḍ", "𝑓öõḍš"])
+    for start in range(-6, 6):
+        for stop in range(-6, 6):
+            for step in [-3, -2, -1, 1, 2, 3]:
+                expected = pa.array([k.as_py()[start:stop:step]
+                                     for k in arr])
+                result = pc.utf8_slice_codeunits(
+                    arr, start=start, stop=stop, step=step)
+                assert expected.equals(result)
 
 
 def test_split_pattern():
@@ -337,29 +494,45 @@ def test_split_whitespace_ascii():
     assert expected.equals(result)
 
 
+def test_split_pattern_regex():
+    arr = pa.array(["-foo---bar--", "---foo---b"])
+    result = pc.split_pattern_regex(arr, pattern="-+")
+    expected = pa.array([["", "foo", "bar", ""], ["", "foo", "b"]])
+    assert expected.equals(result)
+
+    result = pc.split_pattern_regex(arr, pattern="-+", max_splits=1)
+    expected = pa.array([["", "foo---bar--"], ["", "foo---b"]])
+    assert expected.equals(result)
+
+    with pytest.raises(NotImplementedError,
+                       match="Cannot split in reverse with regex"):
+        result = pc.split_pattern_regex(
+            arr, pattern="---", max_splits=1, reverse=True)
+
+
 def test_min_max():
     # An example generated function wrapper with possible options
     data = [4, 5, 6, None, 1]
     s = pc.min_max(data)
     assert s.as_py() == {'min': 1, 'max': 6}
-    s = pc.min_max(data, options=pc.MinMaxOptions())
+    s = pc.min_max(data, options=pc.ScalarAggregateOptions())
     assert s.as_py() == {'min': 1, 'max': 6}
-    s = pc.min_max(data, options=pc.MinMaxOptions(null_handling='skip'))
+    s = pc.min_max(data, options=pc.ScalarAggregateOptions(skip_nulls=True))
     assert s.as_py() == {'min': 1, 'max': 6}
-    s = pc.min_max(data, options=pc.MinMaxOptions(null_handling='emit_null'))
+    s = pc.min_max(data, options=pc.ScalarAggregateOptions(skip_nulls=False))
     assert s.as_py() == {'min': None, 'max': None}
 
     # Options as dict of kwargs
-    s = pc.min_max(data, options={'null_handling': 'emit_null'})
+    s = pc.min_max(data, options={'skip_nulls': False})
     assert s.as_py() == {'min': None, 'max': None}
     # Options as named functions arguments
-    s = pc.min_max(data, null_handling='emit_null')
+    s = pc.min_max(data, skip_nulls=False)
     assert s.as_py() == {'min': None, 'max': None}
 
     # Both options and named arguments
     with pytest.raises(TypeError):
-        s = pc.min_max(data, options=pc.MinMaxOptions(),
-                       null_handling='emit_null')
+        s = pc.min_max(
+            data, options=pc.ScalarAggregateOptions(), skip_nulls=False)
 
     # Wrong options type
     options = pc.TakeOptions()
@@ -368,37 +541,47 @@ def test_min_max():
 
     # Missing argument
     with pytest.raises(
-            TypeError,
-            match=r"min_max\(\) missing 1 required positional argument"):
+            ValueError,
+            match=r"Function min_max accepts 1 argument"):
         s = pc.min_max()
 
 
 def test_any():
     # ARROW-1846
+
+    options = pc.ScalarAggregateOptions(skip_nulls=False)
     a = pa.array([False, None, True])
     assert pc.any(a).as_py() is True
+    assert pc.any(a, options=options).as_py() is True
 
     a = pa.array([False, None, False])
     assert pc.any(a).as_py() is False
+    assert pc.any(a, options=options).as_py() is None
 
 
 def test_all():
     # ARROW-10301
 
+    options = pc.ScalarAggregateOptions(skip_nulls=False)
     a = pa.array([], type='bool')
     assert pc.all(a).as_py() is True
+    assert pc.all(a, options=options).as_py() is True
 
     a = pa.array([False, True])
     assert pc.all(a).as_py() is False
+    assert pc.all(a, options=options).as_py() is False
 
     a = pa.array([True, None])
     assert pc.all(a).as_py() is True
+    assert pc.all(a, options=options).as_py() is None
 
     a = pa.chunked_array([[True], [True, None]])
     assert pc.all(a).as_py() is True
+    assert pc.all(a, options=options).as_py() is None
 
     a = pa.chunked_array([[True], [False]])
     assert pc.all(a).as_py() is False
+    assert pc.all(a, options=options).as_py() is False
 
 
 def test_is_valid():
@@ -415,7 +598,7 @@ def test_generated_docstrings():
         Compute the minimum and maximum values of a numeric array.
 
         Null values are ignored by default.
-        This can be changed through MinMaxOptions.
+        This can be changed through ScalarAggregateOptions.
 
         Parameters
         ----------
@@ -423,10 +606,10 @@ def test_generated_docstrings():
             Argument to compute function
         memory_pool : pyarrow.MemoryPool, optional
             If not passed, will allocate memory from the default memory pool.
-        options : pyarrow.compute.MinMaxOptions, optional
+        options : pyarrow.compute.ScalarAggregateOptions, optional
             Parameters altering compute function semantics
         **kwargs : optional
-            Parameters for MinMaxOptions constructor.  Either `options`
+            Parameters for ScalarAggregateOptions constructor. Either `options`
             or `**kwargs` can be passed, but not both at the same time.
         """)
     assert pc.add.__doc__ == textwrap.dedent("""\
@@ -445,6 +628,22 @@ def test_generated_docstrings():
         memory_pool : pyarrow.MemoryPool, optional
             If not passed, will allocate memory from the default memory pool.
         """)
+
+
+def test_generated_signatures():
+    # The self-documentation provided by signatures should show acceptable
+    # options and their default values.
+    sig = inspect.signature(pc.add)
+    assert str(sig) == "(x, y, *, memory_pool=None)"
+    sig = inspect.signature(pc.min_max)
+    assert str(sig) == ("(array, *, memory_pool=None, "
+                        "options=None, skip_nulls=True, min_count=1)")
+    sig = inspect.signature(pc.quantile)
+    assert str(sig) == ("(array, *, memory_pool=None, "
+                        "options=None, q=0.5, interpolation='linear')")
+    sig = inspect.signature(pc.binary_join_element_wise)
+    assert str(sig) == ("(*strings, memory_pool=None, options=None, "
+                        "null_handling='emit_null', null_replacement='')")
 
 
 # We use isprintable to find about codepoints that Python doesn't know, but
@@ -572,6 +771,101 @@ def test_string_py_compat_boolean(function_name, variant):
             ar = pa.array([c])
             arrow_func = getattr(pc, arrow_name)
             assert arrow_func(ar)[0].as_py() == getattr(c, py_name)()
+
+
+def test_pad():
+    arr = pa.array([None, 'a', 'abcd'])
+    assert pc.ascii_center(arr, width=3).tolist() == [None, ' a ', 'abcd']
+    assert pc.ascii_lpad(arr, width=3).tolist() == [None, '  a', 'abcd']
+    assert pc.ascii_rpad(arr, width=3).tolist() == [None, 'a  ', 'abcd']
+
+    arr = pa.array([None, 'á', 'abcd'])
+    assert pc.utf8_center(arr, width=3).tolist() == [None, ' á ', 'abcd']
+    assert pc.utf8_lpad(arr, width=3).tolist() == [None, '  á', 'abcd']
+    assert pc.utf8_rpad(arr, width=3).tolist() == [None, 'á  ', 'abcd']
+
+
+@pytest.mark.pandas
+def test_replace_slice():
+    offsets = range(-3, 4)
+
+    arr = pa.array([None, '', 'a', 'ab', 'abc', 'abcd', 'abcde'])
+    series = arr.to_pandas()
+    for start in offsets:
+        for stop in offsets:
+            expected = series.str.slice_replace(start, stop, 'XX')
+            actual = pc.binary_replace_slice(
+                arr, start=start, stop=stop, replacement='XX')
+            assert actual.tolist() == expected.tolist()
+
+    arr = pa.array([None, '', 'π', 'πb', 'πbθ', 'πbθd', 'πbθde'])
+    series = arr.to_pandas()
+    for start in offsets:
+        for stop in offsets:
+            expected = series.str.slice_replace(start, stop, 'XX')
+            actual = pc.utf8_replace_slice(
+                arr, start=start, stop=stop, replacement='XX')
+            assert actual.tolist() == expected.tolist()
+
+
+def test_replace_plain():
+    ar = pa.array(['foo', 'food', None])
+    ar = pc.replace_substring(ar, pattern='foo', replacement='bar')
+    assert ar.tolist() == ['bar', 'bard', None]
+
+
+def test_replace_regex():
+    ar = pa.array(['foo', 'mood', None])
+    ar = pc.replace_substring_regex(ar, pattern='(.)oo', replacement=r'\100')
+    assert ar.tolist() == ['f00', 'm00d', None]
+
+
+def test_extract_regex():
+    ar = pa.array(['a1', 'zb2z'])
+    struct = pc.extract_regex(ar, pattern=r'(?P<letter>[ab])(?P<digit>\d)')
+    assert struct.tolist() == [{'letter': 'a', 'digit': '1'}, {
+        'letter': 'b', 'digit': '2'}]
+
+
+def test_binary_join():
+    ar_list = pa.array([['foo', 'bar'], None, []])
+    expected = pa.array(['foo-bar', None, ''])
+    assert pc.binary_join(ar_list, '-').equals(expected)
+
+    separator_array = pa.array(['1', '2'], type=pa.binary())
+    expected = pa.array(['a1b', 'c2d'], type=pa.binary())
+    ar_list = pa.array([['a', 'b'], ['c', 'd']], type=pa.list_(pa.binary()))
+    assert pc.binary_join(ar_list, separator_array).equals(expected)
+
+
+def test_binary_join_element_wise():
+    null = pa.scalar(None, type=pa.string())
+    arrs = [[None, 'a', 'b'], ['c', None, 'd'], [None, '-', '--']]
+    assert pc.binary_join_element_wise(*arrs).to_pylist() == \
+        [None, None, 'b--d']
+    assert pc.binary_join_element_wise('a', 'b', '-').as_py() == 'a-b'
+    assert pc.binary_join_element_wise('a', null, '-').as_py() is None
+    assert pc.binary_join_element_wise('a', 'b', null).as_py() is None
+
+    skip = pc.JoinOptions('skip')
+    assert pc.binary_join_element_wise(*arrs, options=skip).to_pylist() == \
+        [None, 'a', 'b--d']
+    assert pc.binary_join_element_wise(
+        'a', 'b', '-', options=skip).as_py() == 'a-b'
+    assert pc.binary_join_element_wise(
+        'a', null, '-', options=skip).as_py() == 'a'
+    assert pc.binary_join_element_wise(
+        'a', 'b', null, options=skip).as_py() is None
+
+    replace = pc.JoinOptions('replace', null_replacement='spam')
+    assert pc.binary_join_element_wise(*arrs, options=replace).to_pylist() == \
+        [None, 'a-spam', 'b--d']
+    assert pc.binary_join_element_wise(
+        'a', 'b', '-', options=replace).as_py() == 'a-b'
+    assert pc.binary_join_element_wise(
+        'a', null, '-', options=replace).as_py() == 'a-spam'
+    assert pc.binary_join_element_wise(
+        'a', 'b', null, options=replace).as_py() is None
 
 
 @pytest.mark.parametrize(('ty', 'values'), all_array_types)
@@ -970,6 +1264,11 @@ def test_fill_null():
     expected = pa.array([b'a', b'bb', b'ccc'], type=pa.large_binary())
     assert result.equals(expected)
 
+    arr = pa.array(['a', 'bb', None])
+    result = arr.fill_null(None)
+    expected = pa.array(['a', 'bb', None])
+    assert result.equals(expected)
+
 
 @pytest.mark.parametrize('arrow_type', numerical_arrow_types)
 def test_fill_null_array(arrow_type):
@@ -1058,14 +1357,102 @@ def test_strptime():
     assert got == expected
 
 
+def _check_datetime_components(timestamps, timezone=None):
+    from pyarrow.vendored.version import Version
+
+    ts = pd.to_datetime(timestamps).to_series()
+    tsa = pa.array(ts)
+
+    subseconds = ((ts.dt.microsecond * 10**3 +
+                   ts.dt.nanosecond) * 10**-9).round(9)
+    iso_calendar_fields = [
+        pa.field('iso_year', pa.int64()),
+        pa.field('iso_week', pa.int64()),
+        pa.field('iso_day_of_week', pa.int64())
+    ]
+
+    if Version(pd.__version__) < Version("1.1.0"):
+        # https://github.com/pandas-dev/pandas/issues/33206
+        iso_year = ts.map(lambda x: x.isocalendar()[0]).astype("int64")
+        iso_week = ts.map(lambda x: x.isocalendar()[1]).astype("int64")
+        iso_day = ts.map(lambda x: x.isocalendar()[2]).astype("int64")
+    else:
+        # Casting is required because pandas isocalendar returns int32
+        # while arrow isocalendar returns int64.
+        iso_year = ts.dt.isocalendar()["year"].astype("int64")
+        iso_week = ts.dt.isocalendar()["week"].astype("int64")
+        iso_day = ts.dt.isocalendar()["day"].astype("int64")
+
+    iso_calendar = pa.StructArray.from_arrays(
+        [iso_year, iso_week, iso_day],
+        fields=iso_calendar_fields)
+
+    assert pc.year(tsa).equals(pa.array(ts.dt.year))
+    assert pc.month(tsa).equals(pa.array(ts.dt.month))
+    assert pc.day(tsa).equals(pa.array(ts.dt.day))
+    assert pc.day_of_week(tsa).equals(pa.array(ts.dt.dayofweek))
+    assert pc.day_of_year(tsa).equals(pa.array(ts.dt.dayofyear))
+    assert pc.iso_year(tsa).equals(pa.array(iso_year))
+    assert pc.iso_week(tsa).equals(pa.array(iso_week))
+    assert pc.iso_calendar(tsa).equals(iso_calendar)
+    assert pc.quarter(tsa).equals(pa.array(ts.dt.quarter))
+    assert pc.hour(tsa).equals(pa.array(ts.dt.hour))
+    assert pc.minute(tsa).equals(pa.array(ts.dt.minute))
+    assert pc.second(tsa).equals(pa.array(ts.dt.second.values))
+    assert pc.millisecond(tsa).equals(pa.array(ts.dt.microsecond // 10**3))
+    assert pc.microsecond(tsa).equals(pa.array(ts.dt.microsecond % 10**3))
+    assert pc.nanosecond(tsa).equals(pa.array(ts.dt.nanosecond))
+    assert pc.subsecond(tsa).equals(pa.array(subseconds))
+
+    day_of_week_options = pc.DayOfWeekOptions(
+        one_based_numbering=True, week_start=1)
+    assert pc.day_of_week(tsa, options=day_of_week_options).equals(
+        pa.array(ts.dt.dayofweek+1))
+
+
+@pytest.mark.pandas
+def test_extract_datetime_components():
+    timestamps = ["1970-01-01T00:00:59.123456789",
+                  "2000-02-29T23:23:23.999999999",
+                  "2033-05-18T03:33:20.000000000",
+                  "2020-01-01T01:05:05.001",
+                  "2019-12-31T02:10:10.002",
+                  "2019-12-30T03:15:15.003",
+                  "2009-12-31T04:20:20.004132",
+                  "2010-01-01T05:25:25.005321",
+                  "2010-01-03T06:30:30.006163",
+                  "2010-01-04T07:35:35",
+                  "2006-01-01T08:40:40",
+                  "2005-12-31T09:45:45",
+                  "2008-12-28",
+                  "2008-12-29",
+                  "2012-01-01 01:02:03"]
+
+    _check_datetime_components(timestamps)
+
+
 def test_count():
     arr = pa.array([1, 2, 3, None, None])
     assert pc.count(arr).as_py() == 3
-    assert pc.count(arr, count_mode='count_non_null').as_py() == 3
-    assert pc.count(arr, count_mode='count_null').as_py() == 2
+    assert pc.count(arr, skip_nulls=True).as_py() == 3
+    assert pc.count(arr, skip_nulls=False).as_py() == 2
 
-    with pytest.raises(ValueError, match="'zzz' is not a valid count_mode"):
-        pc.count(arr, count_mode='zzz')
+    with pytest.raises(TypeError, match="an integer is required"):
+        pc.count(arr, min_count='zzz')
+
+
+def test_index():
+    arr = pa.array([0, 1, None, 3, 4], type=pa.int64())
+    assert pc.index(arr, pa.scalar(0)).as_py() == 0
+    assert pc.index(arr, pa.scalar(2, type=pa.int8())).as_py() == -1
+    assert pc.index(arr, 4).as_py() == 4
+    assert arr.index(3, start=2).as_py() == 3
+    assert arr.index(None).as_py() == -1
+
+    arr = pa.chunked_array([[1, 2], [1, 3]], type=pa.int64())
+    assert arr.index(1).as_py() == 0
+    assert arr.index(1, start=2).as_py() == 2
+    assert arr.index(1, start=1, end=2).as_py() == -1
 
 
 def test_partition_nth():
@@ -1199,3 +1586,88 @@ def test_quantile():
         pc.quantile(arr, q=1.1)
     with pytest.raises(ValueError, match="'zzz' is not a valid interpolation"):
         pc.quantile(arr, interpolation='zzz')
+
+
+def test_tdigest():
+    arr = pa.array([1, 2, 3, 4])
+    result = pc.tdigest(arr)
+    assert result.to_pylist() == [2.5]
+
+    arr = pa.chunked_array([pa.array([1, 2]), pa.array([3, 4])])
+    result = pc.tdigest(arr)
+    assert result.to_pylist() == [2.5]
+
+    arr = pa.array([1, 2, 3, 4])
+    result = pc.tdigest(arr, q=[0, 0.5, 1])
+    assert result.to_pylist() == [1, 2.5, 4]
+
+    arr = pa.chunked_array([pa.array([1, 2]), pa.array([3, 4])])
+    result = pc.tdigest(arr, q=[0, 0.5, 1])
+    assert result.to_pylist() == [1, 2.5, 4]
+
+
+def test_fill_null_segfault():
+    # ARROW-12672
+    arr = pa.array([None], pa.bool_()).fill_null(False)
+    result = arr.cast(pa.int8())
+    assert result == pa.array([0], pa.int8())
+
+
+def test_min_max_element_wise():
+    arr1 = pa.array([1, 2, 3])
+    arr2 = pa.array([3, 1, 2])
+    arr3 = pa.array([2, 3, None])
+
+    result = pc.max_element_wise(arr1, arr2)
+    assert result == pa.array([3, 2, 3])
+    result = pc.min_element_wise(arr1, arr2)
+    assert result == pa.array([1, 1, 2])
+
+    result = pc.max_element_wise(arr1, arr2, arr3)
+    assert result == pa.array([3, 3, 3])
+    result = pc.min_element_wise(arr1, arr2, arr3)
+    assert result == pa.array([1, 1, 2])
+
+    # with specifying the option
+    result = pc.max_element_wise(arr1, arr3, skip_nulls=True)
+    assert result == pa.array([2, 3, 3])
+    result = pc.min_element_wise(arr1, arr3, skip_nulls=True)
+    assert result == pa.array([1, 2, 3])
+    result = pc.max_element_wise(
+        arr1, arr3, options=pc.ElementWiseAggregateOptions())
+    assert result == pa.array([2, 3, 3])
+    result = pc.min_element_wise(
+        arr1, arr3, options=pc.ElementWiseAggregateOptions())
+    assert result == pa.array([1, 2, 3])
+
+    # not skipping nulls
+    result = pc.max_element_wise(arr1, arr3, skip_nulls=False)
+    assert result == pa.array([2, 3, None])
+    result = pc.min_element_wise(arr1, arr3, skip_nulls=False)
+    assert result == pa.array([1, 2, None])
+
+
+def test_make_struct():
+    assert pc.make_struct(1, 'a').as_py() == {'0': 1, '1': 'a'}
+
+    assert pc.make_struct(1, 'a', field_names=['i', 's']).as_py() == {
+        'i': 1, 's': 'a'}
+
+    assert pc.make_struct([1, 2, 3],
+                          "a b c".split()) == pa.StructArray.from_arrays([
+                              [1, 2, 3],
+                              "a b c".split()], names='0 1'.split())
+
+    with pytest.raises(ValueError, match="Array arguments must all "
+                                         "be the same length"):
+        pc.make_struct([1, 2, 3, 4], "a b c".split())
+
+    with pytest.raises(ValueError, match="0 arguments but 2 field names"):
+        pc.make_struct(field_names=['one', 'two'])
+
+
+def test_case_when():
+    assert pc.case_when(pc.make_struct([True, False, None],
+                                       [False, True, None]),
+                        [1, 2, 3],
+                        [11, 12, 13]) == pa.array([1, 12, None])

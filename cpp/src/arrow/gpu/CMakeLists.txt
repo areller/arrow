@@ -32,11 +32,9 @@ endif()
 find_package(CUDA REQUIRED)
 include_directories(SYSTEM ${CUDA_INCLUDE_DIRS})
 
-message(STATUS "CUDA Libraries: ${CUDA_LIBRARIES}")
-
 set(ARROW_CUDA_SRCS cuda_arrow_ipc.cc cuda_context.cc cuda_internal.cc cuda_memory.cc)
 
-set(ARROW_CUDA_SHARED_LINK_LIBS ${CUDA_LIBRARIES} ${CUDA_CUDA_LIBRARY})
+set(ARROW_CUDA_SHARED_LINK_LIBS ${CUDA_CUDA_LIBRARY})
 
 add_arrow_lib(arrow_cuda
               CMAKE_PACKAGE_NAME
@@ -53,7 +51,8 @@ add_arrow_lib(arrow_cuda
               arrow_shared
               ${ARROW_CUDA_SHARED_LINK_LIBS}
               # Static arrow_cuda must also link against CUDA shared libs
-              STATIC_LINK_LIBS ${ARROW_CUDA_SHARED_LINK_LIBS})
+              STATIC_LINK_LIBS
+              ${ARROW_CUDA_SHARED_LINK_LIBS})
 
 add_dependencies(arrow_cuda ${ARROW_CUDA_LIBRARIES})
 

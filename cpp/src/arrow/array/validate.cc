@@ -180,7 +180,7 @@ struct ValidateArrayImpl {
   bool IsBufferValid(int index) { return IsBufferValid(data, index); }
 
   static bool IsBufferValid(const ArrayData& data, int index) {
-    return data.buffers[index] != nullptr && data.buffers[index]->data() != nullptr;
+    return data.buffers[index] != nullptr && data.buffers[index]->address() != 0;
   }
 
   template <typename BinaryType>
@@ -527,6 +527,7 @@ struct ValidateArrayFullImpl {
       }
 
       // Check offsets are in bounds
+      std::vector<int64_t> last_child_offsets(256, 0);
       const int32_t* offsets = data.GetValues<int32_t>(2);
       for (int64_t i = 0; i < data.length; ++i) {
         const int32_t code = type_codes[i];
@@ -541,6 +542,11 @@ struct ValidateArrayFullImpl {
                                  "than child length (",
                                  offset, " >= ", child_lengths[code], ")");
         }
+        if (offset < last_child_offsets[code]) {
+          return Status::Invalid("Union value at position ", i,
+                                 " has non-monotonic offset ", offset);
+        }
+        last_child_offsets[code] = offset;
       }
     }
 
@@ -549,7 +555,7 @@ struct ValidateArrayFullImpl {
       const ArrayData& field = *data.child_data[i];
       const Status field_valid = ValidateArrayFull(field);
       if (!field_valid.ok()) {
-        return Status::Invalid("Struct child array #", i,
+        return Status::Invalid("Union child array #", i,
                                " invalid: ", field_valid.ToString());
       }
     }

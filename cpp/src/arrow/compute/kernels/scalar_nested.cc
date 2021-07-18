@@ -29,7 +29,7 @@ namespace internal {
 namespace {
 
 template <typename Type, typename offset_type = typename Type::offset_type>
-void ListValueLength(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
+Status ListValueLength(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
   using ScalarType = typename TypeTraits<Type>::ScalarType;
   using OffsetScalarType = typename TypeTraits<Type>::OffsetScalarType;
 
@@ -51,6 +51,8 @@ void ListValueLength(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
           static_cast<offset_type>(arg0.value->length());
     }
   }
+
+  return Status::OK();
 }
 
 const FunctionDoc list_value_length_doc{
@@ -60,12 +62,26 @@ const FunctionDoc list_value_length_doc{
      "Null values emit a null in the output."),
     {"lists"}};
 
-Result<ValueDescr> ProjectResolve(KernelContext* ctx,
-                                  const std::vector<ValueDescr>& descrs) {
-  const auto& names = OptionsWrapper<ProjectOptions>::Get(ctx).field_names;
-  if (names.size() != descrs.size()) {
-    return Status::Invalid("project() was passed ", names.size(), " field ", "names but ",
-                           descrs.size(), " arguments");
+Result<ValueDescr> MakeStructResolve(KernelContext* ctx,
+                                     const std::vector<ValueDescr>& descrs) {
+  auto names = OptionsWrapper<MakeStructOptions>::Get(ctx).field_names;
+  auto nullable = OptionsWrapper<MakeStructOptions>::Get(ctx).field_nullability;
+  auto metadata = OptionsWrapper<MakeStructOptions>::Get(ctx).field_metadata;
+
+  if (names.size() == 0) {
+    names.resize(descrs.size());
+    nullable.resize(descrs.size(), true);
+    metadata.resize(descrs.size(), nullptr);
+    int i = 0;
+    for (auto& name : names) {
+      name = std::to_string(i++);
+    }
+  } else if (names.size() != descrs.size() || nullable.size() != descrs.size() ||
+             metadata.size() != descrs.size()) {
+    return Status::Invalid("make_struct() was passed ", descrs.size(), " arguments but ",
+                           names.size(), " field names, ", nullable.size(),
+                           " nullability bits, and ", metadata.size(),
+                           " metadata dictionaries.");
   }
 
   size_t i = 0;
@@ -86,15 +102,25 @@ Result<ValueDescr> ProjectResolve(KernelContext* ctx,
       }
     }
 
-    fields[i] = field(names[i], descr.type);
+    fields[i] =
+        field(std::move(names[i]), descr.type, nullable[i], std::move(metadata[i]));
     ++i;
   }
 
   return ValueDescr{struct_(std::move(fields)), shape};
 }
 
-void ProjectExec(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
-  KERNEL_ASSIGN_OR_RAISE(auto descr, ctx, ProjectResolve(ctx, batch.GetDescriptors()));
+Status MakeStructExec(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
+  ARROW_ASSIGN_OR_RAISE(auto descr, MakeStructResolve(ctx, batch.GetDescriptors()));
+
+  for (int i = 0; i < batch.num_values(); ++i) {
+    const auto& field = checked_cast<const StructType&>(*descr.type).field(i);
+    if (batch[i].null_count() > 0 && !field->nullable()) {
+      return Status::Invalid("Output field ", field, " (#", i,
+                             ") does not allow nulls but the corresponding "
+                             "argument was not entirely valid.");
+    }
+  }
 
   if (descr.shape == ValueDescr::SCALAR) {
     ScalarVector scalars(batch.num_values());
@@ -104,7 +130,7 @@ void ProjectExec(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
 
     *out =
         Datum(std::make_shared<StructScalar>(std::move(scalars), std::move(descr.type)));
-    return;
+    return Status::OK();
   }
 
   ArrayVector arrays(batch.num_values());
@@ -114,19 +140,19 @@ void ProjectExec(KernelContext* ctx, const ExecBatch& batch, Datum* out) {
       continue;
     }
 
-    KERNEL_ASSIGN_OR_RAISE(
-        arrays[i], ctx,
-        MakeArrayFromScalar(*batch[i].scalar(), batch.length, ctx->memory_pool()));
+    ARROW_ASSIGN_OR_RAISE(arrays[i], MakeArrayFromScalar(*batch[i].scalar(), batch.length,
+                                                         ctx->memory_pool()));
   }
 
   *out = std::make_shared<StructArray>(descr.type, batch.length, std::move(arrays));
+  return Status::OK();
 }
 
-const FunctionDoc project_doc{"Wrap Arrays into a StructArray",
-                              ("Names of the StructArray's fields are\n"
-                               "specified through ProjectOptions."),
-                              {"*args"},
-                              "ProjectOptions"};
+const FunctionDoc make_struct_doc{"Wrap Arrays into a StructArray",
+                                  ("Names of the StructArray's fields are\n"
+                                   "specified through MakeStructOptions."),
+                                  {"*args"},
+                                  "MakeStructOptions"};
 
 }  // namespace
 
@@ -139,15 +165,17 @@ void RegisterScalarNested(FunctionRegistry* registry) {
                                          ListValueLength<LargeListType>));
   DCHECK_OK(registry->AddFunction(std::move(list_value_length)));
 
-  auto project_function =
-      std::make_shared<ScalarFunction>("project", Arity::VarArgs(), &project_doc);
-  ScalarKernel kernel{KernelSignature::Make({InputType{}}, OutputType{ProjectResolve},
+  static MakeStructOptions kDefaultMakeStructOptions;
+  auto make_struct_function = std::make_shared<ScalarFunction>(
+      "make_struct", Arity::VarArgs(), &make_struct_doc, &kDefaultMakeStructOptions);
+
+  ScalarKernel kernel{KernelSignature::Make({InputType{}}, OutputType{MakeStructResolve},
                                             /*is_varargs=*/true),
-                      ProjectExec, OptionsWrapper<ProjectOptions>::Init};
+                      MakeStructExec, OptionsWrapper<MakeStructOptions>::Init};
   kernel.null_handling = NullHandling::OUTPUT_NOT_NULL;
   kernel.mem_allocation = MemAllocation::NO_PREALLOCATE;
-  DCHECK_OK(project_function->AddKernel(std::move(kernel)));
-  DCHECK_OK(registry->AddFunction(std::move(project_function)));
+  DCHECK_OK(make_struct_function->AddKernel(std::move(kernel)));
+  DCHECK_OK(registry->AddFunction(std::move(make_struct_function)));
 }
 
 }  // namespace internal

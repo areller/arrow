@@ -30,73 +30,12 @@
 #include <signal.h>  // Needed for struct sigaction
 #endif
 
-#include "arrow/io/interfaces.h"
 #include "arrow/status.h"
 #include "arrow/type_fwd.h"
 #include "arrow/util/macros.h"
 #include "arrow/util/windows_fixup.h"
 
 namespace arrow {
-
-class Buffer;
-
-namespace io {
-
-// Output stream that just writes to stdout.
-class ARROW_EXPORT StdoutStream : public OutputStream {
- public:
-  StdoutStream();
-  ~StdoutStream() override {}
-
-  Status Close() override;
-  bool closed() const override;
-
-  Result<int64_t> Tell() const override;
-
-  Status Write(const void* data, int64_t nbytes) override;
-
- private:
-  int64_t pos_;
-};
-
-// Output stream that just writes to stderr.
-class ARROW_EXPORT StderrStream : public OutputStream {
- public:
-  StderrStream();
-  ~StderrStream() override {}
-
-  Status Close() override;
-  bool closed() const override;
-
-  Result<int64_t> Tell() const override;
-
-  Status Write(const void* data, int64_t nbytes) override;
-
- private:
-  int64_t pos_;
-};
-
-// Input stream that just reads from stdin.
-class ARROW_EXPORT StdinStream : public InputStream {
- public:
-  StdinStream();
-  ~StdinStream() override {}
-
-  Status Close() override;
-  bool closed() const override;
-
-  Result<int64_t> Tell() const override;
-
-  Result<int64_t> Read(int64_t nbytes, void* out) override;
-
-  Result<std::shared_ptr<Buffer>> Read(int64_t nbytes) override;
-
- private:
-  int64_t pos_;
-};
-
-}  // namespace io
-
 namespace internal {
 
 // NOTE: 8-bit path strings on Windows are encoded using UTF-8.
@@ -270,6 +209,8 @@ std::shared_ptr<StatusDetail> StatusDetailFromErrno(int errnum);
 ARROW_EXPORT
 std::shared_ptr<StatusDetail> StatusDetailFromWinError(int errnum);
 #endif
+ARROW_EXPORT
+std::shared_ptr<StatusDetail> StatusDetailFromSignal(int signum);
 
 template <typename... Args>
 Status StatusFromErrno(int errnum, StatusCode code, Args&&... args) {
@@ -295,12 +236,26 @@ Status IOErrorFromWinError(int errnum, Args&&... args) {
 }
 #endif
 
+template <typename... Args>
+Status StatusFromSignal(int signum, StatusCode code, Args&&... args) {
+  return Status::FromDetailAndArgs(code, StatusDetailFromSignal(signum),
+                                   std::forward<Args>(args)...);
+}
+
+template <typename... Args>
+Status CancelledFromSignal(int signum, Args&&... args) {
+  return StatusFromSignal(signum, StatusCode::Cancelled, std::forward<Args>(args)...);
+}
+
 ARROW_EXPORT
 int ErrnoFromStatus(const Status&);
 
 // Always returns 0 on non-Windows platforms (for Python).
 ARROW_EXPORT
 int WinErrorFromStatus(const Status&);
+
+ARROW_EXPORT
+int SignalFromStatus(const Status&);
 
 class ARROW_EXPORT TemporaryDir {
  public:
@@ -354,6 +309,26 @@ Result<SignalHandler> GetSignalHandler(int signum);
 ARROW_EXPORT
 Result<SignalHandler> SetSignalHandler(int signum, const SignalHandler& handler);
 
+/// \brief Reinstate the signal handler
+///
+/// For use in signal handlers.  This is needed on platforms without sigaction()
+/// such as Windows, as the default signal handler is restored there as
+/// soon as a signal is raised.
+ARROW_EXPORT
+void ReinstateSignalHandler(int signum, SignalHandler::Callback handler);
+
+/// \brief Send a signal to the current process
+///
+/// The thread which will receive the signal is unspecified.
+ARROW_EXPORT
+Status SendSignal(int signum);
+
+/// \brief Send a signal to the given thread
+///
+/// This function isn't supported on Windows.
+ARROW_EXPORT
+Status SendSignalToThread(int signum, uint64_t thread_id);
+
 /// \brief Get an unpredictable random seed
 ///
 /// This function may be slightly costly, so should only be used to initialize
@@ -362,6 +337,13 @@ Result<SignalHandler> SetSignalHandler(int signum, const SignalHandler& handler)
 /// absolutely necessary (e.g. to generate a cryptographic secret).
 ARROW_EXPORT
 int64_t GetRandomSeed();
+
+/// \brief Get the current thread id
+///
+/// In addition to having the same properties as std::thread, the returned value
+/// is a regular integer value, which is more convenient than an opaque type.
+ARROW_EXPORT
+uint64_t GetThreadId();
 
 }  // namespace internal
 }  // namespace arrow

@@ -18,22 +18,27 @@
 const del = require('del');
 const path = require('path');
 const mkdirp = require('mkdirp');
+const cpy = require('cpy');
 const { argv } = require('./argv');
 const { promisify } = require('util');
 const glob = promisify(require('glob'));
-const rimraf = promisify(require('rimraf'));
 const child_process = require(`child_process`);
 const { memoizeTask } = require('./memoize-task');
 const readFile = promisify(require('fs').readFile);
 const asyncDone = promisify(require('async-done'));
 const exec = promisify(require('child_process').exec);
 const parseXML = promisify(require('xml2js').parseString);
+const { targetAndModuleCombinations, npmPkgName } = require('./util');
 
-const jestArgv = [];
-argv.verbose && jestArgv.push(`--verbose`);
-argv.coverage
-    ? jestArgv.push(`-c`, `jest.coverage.config.js`, `--coverage`, `-i`)
-    : jestArgv.push(`-c`, `jest.config.js`, `-i`)
+const jestArgv = [`--reporters=jest-silent-reporter`];
+
+if (argv.verbose) {
+    jestArgv.push(`--verbose`);
+}
+
+if (targetAndModuleCombinations.length > 1) {
+    jestArgv.push(`--detectOpenHandles`);
+}
 
 const jest = path.join(path.parse(require.resolve(`jest`)).dir, `../bin/jest.js`);
 const testOptions = {
@@ -42,15 +47,21 @@ const testOptions = {
         ...process.env,
         // hide fs.promises/stream[Symbol.asyncIterator] warnings
         NODE_NO_WARNINGS: `1`,
-        // prevent the user-land `readable-stream` module from
-        // patching node's streams -- they're better now
-        READABLE_STREAM: `disable`
     },
 };
 
 const testTask = ((cache, execArgv, testOptions) => memoizeTask(cache, function test(target, format) {
     const opts = { ...testOptions };
-    const args = [...execArgv, `test/unit/`];
+    const args = [...execArgv];
+    if (format === 'esm' || target === 'ts' || target === 'src' || target === npmPkgName) {
+        args.unshift(`--experimental-vm-modules`);
+    }
+    if (argv.coverage) {
+        args.push(`-c`, `jestconfigs/jest.coverage.config.js`);
+    } else {
+        const cfgname = [target, format].filter(Boolean).join('.');
+        args.push(`-c`, `jestconfigs/jest.${cfgname}.config.js`, `test/unit/`);
+    }
     opts.env = {
         ...opts.env,
         TEST_TARGET: target,
@@ -73,7 +84,6 @@ const ARROW_JAVA_DIR = process.env.ARROW_JAVA_DIR || path.join(ARROW_HOME, 'java
 const CPP_EXE_PATH = process.env.ARROW_CPP_EXE_PATH || path.join(ARROW_HOME, 'cpp/build/debug');
 const ARROW_INTEGRATION_DIR = process.env.ARROW_INTEGRATION_DIR || path.join(ARROW_HOME, 'integration');
 const CPP_JSON_TO_ARROW = path.join(CPP_EXE_PATH, 'arrow-json-integration-test');
-const CPP_STREAM_TO_FILE = path.join(CPP_EXE_PATH, 'arrow-stream-to-file');
 const CPP_FILE_TO_STREAM = path.join(CPP_EXE_PATH, 'arrow-file-to-stream');
 
 const testFilesDir = path.join(ARROW_HOME, 'js/test/data');
@@ -93,7 +103,7 @@ async function cleanTestData() {
 
 async function createTestJSON() {
     await mkdirp(jsonFilesDir);
-    await exec(`shx cp ${ARROW_INTEGRATION_DIR}/data/*.json ${jsonFilesDir}`);
+    await cpy(`cp ${ARROW_INTEGRATION_DIR}/data/*.json`, jsonFilesDir);
     await exec(`python3 ${ARROW_INTEGRATION_DIR}/integration_test.py --write_generated_json ${jsonFilesDir}`);
 }
 
@@ -138,7 +148,7 @@ async function createTestData() {
     }
 
     async function generateCPPFile(jsonPath, filePath) {
-        await rimraf(filePath);
+        await del(filePath);
         return await exec(
             `${CPP_JSON_TO_ARROW} ${
             `--integration --mode=JSON_TO_ARROW`} ${
@@ -146,17 +156,17 @@ async function createTestData() {
             { maxBuffer: Math.pow(2, 53) - 1 }
         );
     }
-    
+
     async function generateCPPStream(filePath, streamPath) {
-        await rimraf(streamPath);
+        await del(streamPath);
         return await exec(
             `${CPP_FILE_TO_STREAM} ${filePath} > ${streamPath}`,
             { maxBuffer: Math.pow(2, 53) - 1 }
         );
     }
-    
+
     async function generateJavaFile(jsonPath, filePath) {
-        await rimraf(filePath);
+        await del(filePath);
         return await exec(
             `java -cp ${JAVA_TOOLS_JAR} ${
             `org.apache.arrow.tools.Integration -c JSON_TO_ARROW`} ${
@@ -164,9 +174,9 @@ async function createTestData() {
             { maxBuffer: Math.pow(2, 53) - 1 }
         );
     }
-    
+
     async function generateJavaStream(filePath, streamPath) {
-        await rimraf(streamPath);
+        await del(streamPath);
         return await exec(
             `java -cp ${JAVA_TOOLS_JAR} ${
             `org.apache.arrow.tools.FileToStream`} ${filePath} ${streamPath}`,

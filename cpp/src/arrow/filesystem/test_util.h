@@ -43,7 +43,10 @@ void CreateFile(FileSystem* fs, const std::string& path, const std::string& data
 
 // Sort a vector of FileInfo by lexicographic path order
 ARROW_TESTING_EXPORT
-void SortInfos(std::vector<FileInfo>* infos);
+void SortInfos(FileInfoVector* infos);
+
+ARROW_TESTING_EXPORT
+void CollectFileInfoGenerator(FileInfoGenerator gen, FileInfoVector* out_infos);
 
 ARROW_TESTING_EXPORT
 void AssertFileInfo(const FileInfo& info, const std::string& path, FileType type);
@@ -108,12 +111,17 @@ class ARROW_TESTING_EXPORT GenericFileSystemTest {
   void TestGetFileInfoVector();
   void TestGetFileInfoSelector();
   void TestGetFileInfoSelectorWithRecursion();
+  void TestGetFileInfoAsync();
+  void TestGetFileInfoGenerator();
   void TestOpenOutputStream();
   void TestOpenAppendStream();
   void TestOpenInputStream();
   void TestOpenInputStreamWithFileInfo();
+  void TestOpenInputStreamAsync();
   void TestOpenInputFile();
   void TestOpenInputFileWithFileInfo();
+  void TestOpenInputFileAsync();
+  void TestSpecialChars();
 
  protected:
   // This function should return the filesystem under test.
@@ -127,12 +135,18 @@ class ARROW_TESTING_EXPORT GenericFileSystemTest {
   virtual bool allow_write_file_over_dir() const { return false; }
   // - Whether the filesystem allows moving a directory
   virtual bool allow_move_dir() const { return true; }
+  // - Whether the filesystem allows moving a directory "over" a non-empty destination
+  virtual bool allow_move_dir_over_non_empty_dir() const { return false; }
   // - Whether the filesystem allows appending to a file
   virtual bool allow_append_to_file() const { return true; }
+  // - Whether the filesystem allows appending to a new (not existent yet) file
+  virtual bool allow_append_to_new_file() const { return true; }
   // - Whether the filesystem supports directory modification times
   virtual bool have_directory_mtimes() const { return true; }
   // - Whether some directory tree deletion tests may fail randomly
   virtual bool have_flaky_directory_tree_deletion() const { return false; }
+  // - Whether the filesystem stores some metadata alongside files
+  virtual bool have_file_metadata() const { return false; }
 
   void TestEmpty(FileSystem* fs);
   void TestNormalizePath(FileSystem* fs);
@@ -149,12 +163,17 @@ class ARROW_TESTING_EXPORT GenericFileSystemTest {
   void TestGetFileInfoVector(FileSystem* fs);
   void TestGetFileInfoSelector(FileSystem* fs);
   void TestGetFileInfoSelectorWithRecursion(FileSystem* fs);
+  void TestGetFileInfoAsync(FileSystem* fs);
+  void TestGetFileInfoGenerator(FileSystem* fs);
   void TestOpenOutputStream(FileSystem* fs);
   void TestOpenAppendStream(FileSystem* fs);
   void TestOpenInputStream(FileSystem* fs);
   void TestOpenInputStreamWithFileInfo(FileSystem* fs);
+  void TestOpenInputStreamAsync(FileSystem* fs);
   void TestOpenInputFile(FileSystem* fs);
   void TestOpenInputFileWithFileInfo(FileSystem* fs);
+  void TestOpenInputFileAsync(FileSystem* fs);
+  void TestSpecialChars(FileSystem* fs);
 };
 
 #define GENERIC_FS_TEST_FUNCTION(TEST_MACRO, TEST_CLASS, NAME) \
@@ -176,12 +195,17 @@ class ARROW_TESTING_EXPORT GenericFileSystemTest {
   GENERIC_FS_TEST_FUNCTION(TEST_MACRO, TEST_CLASS, GetFileInfoVector)                \
   GENERIC_FS_TEST_FUNCTION(TEST_MACRO, TEST_CLASS, GetFileInfoSelector)              \
   GENERIC_FS_TEST_FUNCTION(TEST_MACRO, TEST_CLASS, GetFileInfoSelectorWithRecursion) \
+  GENERIC_FS_TEST_FUNCTION(TEST_MACRO, TEST_CLASS, GetFileInfoAsync)                 \
+  GENERIC_FS_TEST_FUNCTION(TEST_MACRO, TEST_CLASS, GetFileInfoGenerator)             \
   GENERIC_FS_TEST_FUNCTION(TEST_MACRO, TEST_CLASS, OpenOutputStream)                 \
   GENERIC_FS_TEST_FUNCTION(TEST_MACRO, TEST_CLASS, OpenAppendStream)                 \
   GENERIC_FS_TEST_FUNCTION(TEST_MACRO, TEST_CLASS, OpenInputStream)                  \
   GENERIC_FS_TEST_FUNCTION(TEST_MACRO, TEST_CLASS, OpenInputStreamWithFileInfo)      \
+  GENERIC_FS_TEST_FUNCTION(TEST_MACRO, TEST_CLASS, OpenInputStreamAsync)             \
   GENERIC_FS_TEST_FUNCTION(TEST_MACRO, TEST_CLASS, OpenInputFile)                    \
-  GENERIC_FS_TEST_FUNCTION(TEST_MACRO, TEST_CLASS, OpenInputFileWithFileInfo)
+  GENERIC_FS_TEST_FUNCTION(TEST_MACRO, TEST_CLASS, OpenInputFileWithFileInfo)        \
+  GENERIC_FS_TEST_FUNCTION(TEST_MACRO, TEST_CLASS, OpenInputFileAsync)               \
+  GENERIC_FS_TEST_FUNCTION(TEST_MACRO, TEST_CLASS, SpecialChars)
 
 #define GENERIC_FS_TEST_FUNCTIONS(TEST_CLASS) \
   GENERIC_FS_TEST_FUNCTIONS_MACROS(TEST_F, TEST_CLASS)

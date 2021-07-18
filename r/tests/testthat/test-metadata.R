@@ -141,6 +141,7 @@ test_that("RecordBatch R metadata", {
 })
 
 test_that("R metadata roundtrip via parquet", {
+  skip_if_not_available("parquet")
   tf <- tempfile()
   on.exit(unlink(tf))
 
@@ -166,7 +167,7 @@ test_that("haven types roundtrip via feather", {
 
 test_that("Date/time type roundtrip", {
   rb <- record_batch(example_with_times)
-  expect_is(rb$schema$posixlt$type, "StructType")
+  expect_r6_class(rb$schema$posixlt$type, "StructType")
   expect_identical(as.data.frame(rb), example_with_times)
 })
 
@@ -203,4 +204,46 @@ test_that("metadata of list elements (ARROW-10386)", {
   tab <- Table$create(df)
   expect_identical(attr(as.data.frame(tab)$x[[1]], "foo"), "bar")
   expect_identical(attr(as.data.frame(tab)$x[[2]], "baz"), "qux")
+})
+
+
+test_that("metadata of list elements (ARROW-10386)", {
+  skip_if_not_available("dataset")
+  skip_if_not_available("parquet")
+
+  library(dplyr)
+
+  df <- tibble::tibble(
+    metadata = list(
+      structure(1, my_value_as_attr = 1),
+      structure(2, my_value_as_attr = 2),
+      structure(3, my_value_as_attr = 3),
+      structure(4, my_value_as_attr = 3)),
+    int = 1L:4L,
+    part = c(1, 3, 2, 1)
+  )
+
+  dst_dir <- make_temp_dir()
+  expect_warning(
+    write_dataset(df, dst_dir, partitioning = "part"),
+    "Row-level metadata is not compatible with datasets and will be discarded"
+  )
+
+  # but we need to write a dataset with row-level metadata to make sure when
+  # reading ones that have been written with them we warn appropriately
+  fake_func_name <- write_dataset
+  fake_func_name(df, dst_dir, partitioning = "part")
+
+  ds <- open_dataset(dst_dir)
+  expect_warning(
+    df_from_ds <- collect(ds),
+    "Row-level metadata is not compatible with this operation and has been ignored"
+  )
+  expect_equal(df_from_ds[c(1, 4, 3, 2), ], df, check.attributes = FALSE)
+
+  # however there is *no* warning if we don't select the metadata column
+  expect_warning(
+    df_from_ds <- ds %>% select(int) %>% collect(),
+    NA
+  )
 })

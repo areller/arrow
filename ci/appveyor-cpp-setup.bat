@@ -50,16 +50,16 @@ set CONDA_PACKAGES=
 
 if "%ARROW_BUILD_GANDIVA%" == "ON" (
   @rem Install llvmdev in the toolchain if building gandiva.dll
-  set CONDA_PACKAGES=%CONDA_PACKAGES% --file=ci\conda_env_gandiva_win.yml
+  set CONDA_PACKAGES=%CONDA_PACKAGES% --file=ci\conda_env_gandiva_win.txt
 )
 if "%JOB%" == "Toolchain" (
   @rem Install pre-built "toolchain" packages for faster builds
-  set CONDA_PACKAGES=%CONDA_PACKAGES% --file=ci\conda_env_cpp.yml
+  set CONDA_PACKAGES=%CONDA_PACKAGES% --file=ci\conda_env_cpp.txt
 )
 if "%JOB%" NEQ "Build_Debug" (
   @rem Arrow conda environment is only required for the Build and Toolchain jobs
   conda create -n arrow -q -y -c conda-forge ^
-    --file=ci\conda_env_python.yml ^
+    --file=ci\conda_env_python.txt ^
     %CONDA_PACKAGES%  ^
     "cmake=3.17" ^
     "ninja" ^
@@ -86,12 +86,12 @@ if defined need_vcvarsall (
 @rem
 @rem Use clcache for faster builds
 @rem
-pip install -q git+https://github.com/frerich/clcache.git
+pip install -q clcache-alt || exit /B
 @rem Limit cache size to 500 MB
 clcache -M 500000000
 clcache -c
 clcache -s
-powershell.exe -Command "Start-Process clcache-server"
+powershell.exe -Command "Start-Process clcache-server" || exit /B
 
 @rem
 @rem Download Minio somewhere on PATH, for unit tests

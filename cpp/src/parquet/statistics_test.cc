@@ -28,7 +28,9 @@
 
 #include "arrow/testing/gtest_util.h"
 #include "arrow/type_traits.h"
+#include "arrow/util/bit_util.h"
 #include "arrow/util/bitmap_ops.h"
+#include "arrow/util/ubsan.h"
 
 #include "parquet/column_reader.h"
 #include "parquet/column_writer.h"
@@ -43,6 +45,9 @@
 
 using arrow::default_memory_pool;
 using arrow::MemoryPool;
+using arrow::util::SafeCopy;
+
+namespace BitUtil = arrow::BitUtil;
 
 namespace parquet {
 
@@ -66,21 +71,51 @@ static FLBA FLBAFromString(const std::string& s) {
 }
 
 TEST(Comparison, SignedByteArray) {
+  // Signed byte array comparison is only used for Decimal comparison. When
+  // decimals are encoded as byte arrays they use twos complement big-endian
+  // encoded values. Comparisons of byte arrays of unequal types need to handle
+  // sign extension.
   auto comparator = MakeComparator<ByteArrayType>(Type::BYTE_ARRAY, SortOrder::SIGNED);
+  struct Case {
+    std::vector<uint8_t> bytes;
+    int order;
+    ByteArray ToByteArray() const {
+      return ByteArray(static_cast<int>(bytes.size()), bytes.data());
+    }
+  };
 
-  std::string s1 = "12345";
-  std::string s2 = "12345678";
-  ByteArray s1ba = ByteArrayFromString(s1);
-  ByteArray s2ba = ByteArrayFromString(s2);
-  ASSERT_TRUE(comparator->Compare(s1ba, s2ba));
+  // Test a mix of big-endian comparison values that are both equal and
+  // unequal after sign extension.
+  std::vector<Case> cases = {
+      {{0x80, 0x80, 0, 0}, 0},           {{/*0xFF,*/ 0x80, 0, 0}, 1},
+      {{0xFF, 0x80, 0, 0}, 1},           {{/*0xFF,*/ 0xFF, 0x01, 0}, 2},
+      {{/*0xFF,  0xFF,*/ 0x80, 0}, 3},   {{/*0xFF,*/ 0xFF, 0x80, 0}, 3},
+      {{0xFF, 0xFF, 0x80, 0}, 3},        {{/*0xFF,0xFF,0xFF,*/ 0x80}, 4},
+      {{/*0xFF, 0xFF, 0xFF,*/ 0xFF}, 5}, {{/*0, 0,*/ 0x01, 0x01}, 6},
+      {{/*0,*/ 0, 0x01, 0x01}, 6},       {{0, 0, 0x01, 0x01}, 6},
+      {{/*0,*/ 0x01, 0x01, 0}, 7},       {{0x01, 0x01, 0, 0}, 8}};
 
-  // This is case where signed comparison UTF-8 (PARQUET-686) is incorrect
-  // This example is to only check signed comparison and not UTF-8.
-  s1 = u8"bügeln";
-  s2 = u8"braten";
-  s1ba = ByteArrayFromString(s1);
-  s2ba = ByteArrayFromString(s2);
-  ASSERT_TRUE(comparator->Compare(s1ba, s2ba));
+  for (size_t x = 0; x < cases.size(); x++) {
+    const auto& case1 = cases[x];
+    // Empty array is always the smallest values
+    EXPECT_TRUE(comparator->Compare(ByteArray(), case1.ToByteArray())) << x;
+    EXPECT_FALSE(comparator->Compare(case1.ToByteArray(), ByteArray())) << x;
+    // Equals is always false.
+    EXPECT_FALSE(comparator->Compare(case1.ToByteArray(), case1.ToByteArray())) << x;
+
+    for (size_t y = 0; y < cases.size(); y++) {
+      const auto& case2 = cases[y];
+      if (case1.order < case2.order) {
+        EXPECT_TRUE(comparator->Compare(case1.ToByteArray(), case2.ToByteArray()))
+            << x << " (order: " << case1.order << ") " << y << " (order: " << case2.order
+            << ")";
+      } else {
+        EXPECT_FALSE(comparator->Compare(case1.ToByteArray(), case2.ToByteArray()))
+            << x << " (order: " << case1.order << ") " << y << " (order: " << case2.order
+            << ")";
+      }
+    }
+  }
 }
 
 TEST(Comparison, UnsignedByteArray) {
@@ -108,21 +143,28 @@ TEST(Comparison, UnsignedByteArray) {
 }
 
 TEST(Comparison, SignedFLBA) {
-  int size = 10;
+  int size = 4;
   auto comparator =
       MakeComparator<FLBAType>(Type::FIXED_LEN_BYTE_ARRAY, SortOrder::SIGNED, size);
 
-  std::string s1 = "Anti123456";
-  std::string s2 = "Bunkd123456";
-  FLBA s1flba = FLBAFromString(s1);
-  FLBA s2flba = FLBAFromString(s2);
-  ASSERT_TRUE(comparator->Compare(s1flba, s2flba));
+  std::vector<uint8_t> byte_values[] = {
+      {0x80, 0, 0, 0},          {0xFF, 0xFF, 0x01, 0},    {0xFF, 0xFF, 0x80, 0},
+      {0xFF, 0xFF, 0xFF, 0x80}, {0xFF, 0xFF, 0xFF, 0xFF}, {0, 0, 0x01, 0x01},
+      {0, 0x01, 0x01, 0},       {0x01, 0x01, 0, 0}};
+  std::vector<FLBA> values_to_compare;
+  for (auto& bytes : byte_values) {
+    values_to_compare.emplace_back(FLBA(bytes.data()));
+  }
 
-  s1 = "Bünk123456";
-  s2 = "Bunk123456";
-  s1flba = FLBAFromString(s1);
-  s2flba = FLBAFromString(s2);
-  ASSERT_TRUE(comparator->Compare(s1flba, s2flba));
+  for (size_t x = 0; x < values_to_compare.size(); x++) {
+    EXPECT_FALSE(comparator->Compare(values_to_compare[x], values_to_compare[x])) << x;
+    for (size_t y = x + 1; y < values_to_compare.size(); y++) {
+      EXPECT_TRUE(comparator->Compare(values_to_compare[x], values_to_compare[y]))
+          << x << " " << y;
+      EXPECT_FALSE(comparator->Compare(values_to_compare[y], values_to_compare[x]))
+          << y << " " << x;
+    }
+  }
 }
 
 TEST(Comparison, UnsignedFLBA) {
@@ -662,10 +704,11 @@ class TestStatisticsSortOrder : public ::testing::Test {
     std::shared_ptr<parquet::FileMetaData> file_metadata = parquet_reader->metadata();
     std::shared_ptr<parquet::RowGroupMetaData> rg_metadata = file_metadata->RowGroup(0);
     for (int i = 0; i < static_cast<int>(fields_.size()); i++) {
+      ARROW_SCOPED_TRACE("Statistics for field #", i);
       std::shared_ptr<parquet::ColumnChunkMetaData> cc_metadata =
           rg_metadata->ColumnChunk(i);
-      ASSERT_EQ(stats_[i].min(), cc_metadata->statistics()->EncodeMin());
-      ASSERT_EQ(stats_[i].max(), cc_metadata->statistics()->EncodeMax());
+      EXPECT_EQ(stats_[i].min(), cc_metadata->statistics()->EncodeMin());
+      EXPECT_EQ(stats_[i].max(), cc_metadata->statistics()->EncodeMax());
     }
   }
 
@@ -894,11 +937,11 @@ template <typename Stats, typename Array, typename T = typename Array::value_typ
 void AssertMinMaxAre(Stats stats, const Array& values, T expected_min, T expected_max) {
   stats->Update(values.data(), values.size(), 0);
   ASSERT_TRUE(stats->HasMinMax());
-  ASSERT_EQ(stats->min(), expected_min);
-  ASSERT_EQ(stats->max(), expected_max);
+  EXPECT_EQ(stats->min(), expected_min);
+  EXPECT_EQ(stats->max(), expected_max);
 }
 
-template <typename Stats, typename Array, typename T = typename Array::value_type>
+template <typename Stats, typename Array, typename T = typename Stats::T>
 void AssertMinMaxAre(Stats stats, const Array& values, const uint8_t* valid_bitmap,
                      T expected_min, T expected_max) {
   auto n_values = values.size();
@@ -906,8 +949,8 @@ void AssertMinMaxAre(Stats stats, const Array& values, const uint8_t* valid_bitm
   auto non_null_count = n_values - null_count;
   stats->UpdateSpaced(values.data(), valid_bitmap, 0, non_null_count, null_count);
   ASSERT_TRUE(stats->HasMinMax());
-  ASSERT_EQ(stats->min(), expected_min);
-  ASSERT_EQ(stats->max(), expected_max);
+  EXPECT_EQ(stats->min(), expected_min);
+  EXPECT_EQ(stats->max(), expected_max);
 }
 
 template <typename Stats, typename Array>
@@ -926,17 +969,17 @@ void AssertUnsetMinMax(Stats stats, const Array& values, const uint8_t* valid_bi
 }
 
 template <typename ParquetType, typename T = typename ParquetType::c_type>
-void CheckExtremums() {
+void CheckExtrema() {
   using UT = typename std::make_unsigned<T>::type;
 
-  T smin = std::numeric_limits<T>::min();
-  T smax = std::numeric_limits<T>::max();
-  T umin = std::numeric_limits<UT>::min();
-  T umax = std::numeric_limits<UT>::max();
+  const T smin = std::numeric_limits<T>::min();
+  const T smax = std::numeric_limits<T>::max();
+  const T umin = SafeCopy<T>(std::numeric_limits<UT>::min());
+  const T umax = SafeCopy<T>(std::numeric_limits<UT>::max());
 
   constexpr int kNumValues = 8;
   std::array<T, kNumValues> values{0,    smin,     smax,     umin,
-                                   umax, smin + 1, smax - 1, umin - 1};
+                                   umax, smin + 1, smax - 1, umax - 1};
 
   NodePtr unsigned_node = PrimitiveNode::Make(
       "uint", Repetition::OPTIONAL,
@@ -947,15 +990,47 @@ void CheckExtremums() {
       LogicalType::Int(sizeof(T) * CHAR_BIT, true /*signed*/), ParquetType::type_num);
   ColumnDescriptor signed_descr(signed_node, 1, 1);
 
-  auto unsigned_stats = MakeStatistics<ParquetType>(&unsigned_descr);
-  AssertMinMaxAre(unsigned_stats, values, umin, umax);
+  {
+    ARROW_SCOPED_TRACE("unsigned statistics: umin = ", umin, ", umax = ", umax,
+                       ", node type = ", unsigned_node->logical_type()->ToString(),
+                       ", physical type = ", unsigned_descr.physical_type(),
+                       ", sort order = ", unsigned_descr.sort_order());
+    auto unsigned_stats = MakeStatistics<ParquetType>(&unsigned_descr);
+    AssertMinMaxAre(unsigned_stats, values, umin, umax);
+  }
+  {
+    ARROW_SCOPED_TRACE("signed statistics: smin = ", smin, ", smax = ", smax,
+                       ", node type = ", signed_node->logical_type()->ToString(),
+                       ", physical type = ", signed_descr.physical_type(),
+                       ", sort order = ", signed_descr.sort_order());
+    auto signed_stats = MakeStatistics<ParquetType>(&signed_descr);
+    AssertMinMaxAre(signed_stats, values, smin, smax);
+  }
 
-  auto signed_stats = MakeStatistics<ParquetType>(&signed_descr);
-  AssertMinMaxAre(signed_stats, values, smin, smax);
+  // With validity bitmap
+  std::vector<bool> is_valid = {true, false, false, false, false, true, true, true};
+  std::shared_ptr<Buffer> valid_bitmap;
+  ::arrow::BitmapFromVector(is_valid, &valid_bitmap);
+  {
+    ARROW_SCOPED_TRACE("spaced unsigned statistics: umin = ", umin, ", umax = ", umax,
+                       ", node type = ", unsigned_node->logical_type()->ToString(),
+                       ", physical type = ", unsigned_descr.physical_type(),
+                       ", sort order = ", unsigned_descr.sort_order());
+    auto unsigned_stats = MakeStatistics<ParquetType>(&unsigned_descr);
+    AssertMinMaxAre(unsigned_stats, values, valid_bitmap->data(), T{0}, umax - 1);
+  }
+  {
+    ARROW_SCOPED_TRACE("spaced signed statistics: smin = ", smin, ", smax = ", smax,
+                       ", node type = ", signed_node->logical_type()->ToString(),
+                       ", physical type = ", signed_descr.physical_type(),
+                       ", sort order = ", signed_descr.sort_order());
+    auto signed_stats = MakeStatistics<ParquetType>(&signed_descr);
+    AssertMinMaxAre(signed_stats, values, valid_bitmap->data(), smin + 1, smax - 1);
+  }
 }
 
-TEST(TestStatistic, Int32Extremums) { CheckExtremums<Int32Type>(); }
-TEST(TestStatistic, Int64Extremums) { CheckExtremums<Int64Type>(); }
+TEST(TestStatistic, Int32Extrema) { CheckExtrema<Int32Type>(); }
+TEST(TestStatistic, Int64Extrema) { CheckExtrema<Int64Type>(); }
 
 // PARQUET-1225: Float NaN values may lead to incorrect min-max
 template <typename ParquetType>
